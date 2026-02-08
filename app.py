@@ -326,266 +326,175 @@ with tab_plan:
     # ── Guard: need a mesh to continue ───────────────────────
     if st.session_state.skull_mesh is None:
         st.info("⬆️ Upload or generate a skull mesh to continue.")
-        st.stop()
 
-    # ──────────────────────────────────────────────────────────
-    st.header("Step 2 — Define Cut Planes & Perform Osteotomies")
+    if st.session_state.skull_mesh is not None:
+        from surgical_sim import SurgicalCutter
 
-    from surgical_sim import SurgicalCutter
+        st.header("Step 2 — Define Cut Planes & Perform Osteotomies")
 
-    # Show whether we have separate meshes
-    has_separate = (
-        st.session_state.maxilla_mesh is not None
-        and st.session_state.mandible_mesh is not None
-    )
-    if has_separate:
-        st.success("✅ Separate maxilla & mandible loaded — cuts will be anatomically correct.")
-    else:
-        st.warning("⚠️ Single mesh mode — for best results, load from ToothFairy3 labels.")
-
-    # Dynamic slider ranges based on actual mesh bounds
-    bounds = st.session_state.skull_mesh.bounds
-    x_min, x_max = float(bounds[0]), float(bounds[1])
-    y_min, y_max = float(bounds[2]), float(bounds[3])
-    z_min, z_max = float(bounds[4]), float(bounds[5])
-    x_mid = (x_min + x_max) / 2.0
-    z_mid = (z_min + z_max) / 2.0
-
-    st.info(
-        f"📏 Mesh bounds — "
-        f"X (left-right): [{x_min:.1f}, {x_max:.1f}]  ·  "
-        f"Y (front-back): [{y_min:.1f}, {y_max:.1f}]  ·  "
-        f"Z (up-down): [{z_min:.1f}, {z_max:.1f}]"
-    )
-
-    col_sliders, col_preview = st.columns([1, 2])
-
-    with col_sliders:
-        st.subheader("3 Cut Planes")
-
-        st.markdown("**🔴 Le Fort I** — horizontal cut through maxilla")
-        lefort_z = st.slider(
-            "Le Fort I height (Z)",
-            min_value=float(z_min), max_value=float(z_max),
-            value=float(z_mid + (z_max - z_mid) * 0.3),
-            step=0.5, key="lefort_z",
+        has_separate = (
+            st.session_state.maxilla_mesh is not None
+            and st.session_state.mandible_mesh is not None
         )
-        lefort_flip = st.checkbox(
-            "Flip Le Fort mobile side",
-            value=False,
-            key="lefort_flip",
-            help="Use this if the wrong maxillary side is being freed after the cut.",
-        )
-
-        st.markdown("**🔵 BSSO** — sagittal cuts through mandibular rami")
-        bsso_l_x = st.slider(
-            "BSSO Left (X)",
-            min_value=float(x_min), max_value=float(x_mid),
-            value=float(x_min + (x_mid - x_min) * 0.3),
-            step=0.5, key="bsso_l_x",
-        )
-        bsso_r_x = st.slider(
-            "BSSO Right (X)",
-            min_value=float(x_mid), max_value=float(x_max),
-            value=float(x_mid + (x_max - x_mid) * 0.7),
-            step=0.5, key="bsso_r_x",
-        )
-
-        with st.expander("🔧 Plane Angle Controls"):
-            st.caption("Tilt planes from their default orientation (degrees).")
-            st.markdown("**Le Fort I**")
-            lefort_pitch = st.slider("Le Fort Pitch", -45.0, 45.0, 0.0, 1.0, key="lefort_pitch")
-            lefort_yaw = st.slider("Le Fort Yaw", -45.0, 45.0, 0.0, 1.0, key="lefort_yaw")
-            st.markdown("**BSSO Left**")
-            bsso_l_pitch = st.slider("BSSO-L Pitch", -45.0, 45.0, 0.0, 1.0, key="bsso_l_pitch")
-            bsso_l_yaw = st.slider("BSSO-L Yaw", -45.0, 45.0, 0.0, 1.0, key="bsso_l_yaw")
-            st.markdown("**BSSO Right**")
-            bsso_r_pitch = st.slider("BSSO-R Pitch", -45.0, 45.0, 0.0, 1.0, key="bsso_r_pitch")
-            bsso_r_yaw = st.slider("BSSO-R Yaw", -45.0, 45.0, 0.0, 1.0, key="bsso_r_yaw")
-
-        perform_cut = st.button(
-            "✂️ Perform Osteotomies", key="perform_cut", type="primary"
-        )
-
-        auto_update_cut = st.checkbox(
-            "Auto-update cut while moving plane sliders",
-            value=False,
-            key="auto_update_cut",
-            help="Disable for faster UI; click Perform Osteotomies to apply plane changes.",
-        )
-
-    # Collect cut args
-    _cut_args = (
-        lefort_z, bsso_l_x, bsso_r_x,
-        lefort_pitch, lefort_yaw,
-        bsso_l_pitch, bsso_l_yaw,
-        bsso_r_pitch, bsso_r_yaw,
-    )
-
-    # Create cutter with separate meshes if available
-    if has_separate:
-        cutter = SurgicalCutter(
-            st.session_state.maxilla_mesh,
-            st.session_state.mandible_mesh,
-        )
-    else:
-        cutter = SurgicalCutter(st.session_state.skull_mesh)
-
-    preview_signature = (
-        id(st.session_state.skull_mesh),
-        id(st.session_state.maxilla_mesh),
-        id(st.session_state.mandible_mesh),
-        *_cut_args,
-    )
-    if st.session_state.preview_signature != preview_signature:
-        st.session_state.preview_planes = cutter.preview_planes(*_cut_args)
-        st.session_state.preview_signature = preview_signature
-    planes = st.session_state.preview_planes
-
-    with col_preview:
-        st.subheader("Cut Plane Preview")
-        st.caption("🖱️ Left-drag to rotate · Right-drag to pan · Scroll to zoom")
-        plotter = pv.Plotter(window_size=(700, 500))
-        # Show maxilla and mandible in different colours
         if has_separate:
-            plotter.add_mesh(planes["maxilla"], color="lightyellow", opacity=0.6,
-                             label="Maxilla")
-            if planes["mandible"] is not None:
-                plotter.add_mesh(planes["mandible"], color="lightcyan", opacity=0.6,
-                                 label="Mandible")
+            st.success("✅ Separate maxilla & mandible loaded — cuts will be anatomically correct.")
         else:
-            plotter.add_mesh(planes["combined"], color="ivory", opacity=0.6)
-        plotter.add_mesh(planes["lefort"], color="red", opacity=0.3,
-                         label="Le Fort I")
-        plotter.add_mesh(planes["bsso_l"], color="blue", opacity=0.3,
-                         label="BSSO Left")
-        plotter.add_mesh(planes["bsso_r"], color="blue", opacity=0.3,
-                         label="BSSO Right")
-        plotter.add_legend()
-        plotter.camera_position = "xz"
-        plotter.background_color = "white"
-        _preview_key = f"preview_3d_{hash((_cut_args, lefort_flip, has_separate))}"
-        stpyvista(plotter, key=_preview_key)
+            st.warning("⚠️ Single mesh mode — for best results, load from ToothFairy3 labels.")
 
-    # --- Perform cut (or re-perform) ---
-    cut_signature = (*_cut_args, bool(lefort_flip), bool(has_separate))
-    should_recut = (
-        perform_cut
-        or (
-            auto_update_cut
-            and
-            st.session_state.cut_result is not None
-            and st.session_state.last_cut_signature != cut_signature
+        bounds = st.session_state.skull_mesh.bounds
+        x_min, x_max = float(bounds[0]), float(bounds[1])
+        y_min, y_max = float(bounds[2]), float(bounds[3])
+        z_min, z_max = float(bounds[4]), float(bounds[5])
+        x_mid = (x_min + x_max) / 2.0
+        z_mid = (z_min + z_max) / 2.0
+
+        st.info(
+            f"📏 Mesh bounds — "
+            f"X: [{x_min:.1f}, {x_max:.1f}]  ·  "
+            f"Y: [{y_min:.1f}, {y_max:.1f}]  ·  "
+            f"Z: [{z_min:.1f}, {z_max:.1f}]"
         )
-    )
-    if should_recut:
-        with (st.spinner("Cutting bone …") if perform_cut else st.empty()):
-            result = cutter.perform_cut(*_cut_args, lefort_flip=lefort_flip)
-            st.session_state.cut_result = result
-            st.session_state.cutter = cutter
-            st.session_state.last_cut_signature = cut_signature
-            st.session_state.moved_signature = None
-            st.session_state.moved_segments = None
 
-            if perform_cut:
-                n_skull = result["upper_skull"].n_points if result["upper_skull"] is not None else 0
+        col_sliders, col_preview = st.columns([1, 2])
+
+        with col_sliders:
+            st.subheader("3 Cut Planes")
+            st.markdown("**🔴 Le Fort I** — horizontal cut through maxilla")
+            lefort_z = st.slider("Le Fort I height (Z)", float(z_min), float(z_max),
+                                  float(z_mid + (z_max - z_mid) * 0.3), 0.5, key="lefort_z")
+            lefort_flip = st.checkbox("Flip Le Fort mobile side", False, key="lefort_flip",
+                                       help="Use this if the wrong maxillary side is being freed.")
+
+            st.markdown("**🔵 BSSO** — sagittal cuts through mandibular rami")
+            bsso_l_x = st.slider("BSSO Left (X)", float(x_min), float(x_mid),
+                                  float(x_min + (x_mid - x_min) * 0.3), 0.5, key="bsso_l_x")
+            bsso_r_x = st.slider("BSSO Right (X)", float(x_mid), float(x_max),
+                                  float(x_mid + (x_max - x_mid) * 0.7), 0.5, key="bsso_r_x")
+
+            with st.expander("🔧 Plane Angle Controls"):
+                st.caption("Tilt planes from their default orientation (degrees).")
+                lefort_pitch = st.slider("Le Fort Pitch", -45.0, 45.0, 0.0, 1.0, key="lefort_pitch")
+                lefort_yaw = st.slider("Le Fort Yaw", -45.0, 45.0, 0.0, 1.0, key="lefort_yaw")
+                bsso_l_pitch = st.slider("BSSO-L Pitch", -45.0, 45.0, 0.0, 1.0, key="bsso_l_pitch")
+                bsso_l_yaw = st.slider("BSSO-L Yaw", -45.0, 45.0, 0.0, 1.0, key="bsso_l_yaw")
+                bsso_r_pitch = st.slider("BSSO-R Pitch", -45.0, 45.0, 0.0, 1.0, key="bsso_r_pitch")
+                bsso_r_yaw = st.slider("BSSO-R Yaw", -45.0, 45.0, 0.0, 1.0, key="bsso_r_yaw")
+
+            perform_cut = st.button("✂️ Perform Osteotomies", key="perform_cut", type="primary")
+
+        _cut_args = (lefort_z, bsso_l_x, bsso_r_x,
+                     lefort_pitch, lefort_yaw, bsso_l_pitch, bsso_l_yaw, bsso_r_pitch, bsso_r_yaw)
+
+        if has_separate:
+            cutter = SurgicalCutter(st.session_state.maxilla_mesh, st.session_state.mandible_mesh)
+        else:
+            cutter = SurgicalCutter(st.session_state.skull_mesh)
+
+        planes = cutter.preview_planes(*_cut_args)
+
+        with col_preview:
+            st.subheader("Cut Plane Preview")
+            st.caption("🖱️ Left-drag to rotate · Right-drag to pan · Scroll to zoom")
+            plotter = pv.Plotter(window_size=(700, 500))
+            if has_separate:
+                plotter.add_mesh(planes["maxilla"], color="lightyellow", opacity=0.6, label="Maxilla")
+                if planes["mandible"] is not None:
+                    plotter.add_mesh(planes["mandible"], color="lightcyan", opacity=0.6, label="Mandible")
+            else:
+                plotter.add_mesh(planes["combined"], color="ivory", opacity=0.6)
+            plotter.add_mesh(planes["lefort"], color="red", opacity=0.3, label="Le Fort I")
+            plotter.add_mesh(planes["bsso_l"], color="blue", opacity=0.3, label="BSSO Left")
+            plotter.add_mesh(planes["bsso_r"], color="blue", opacity=0.3, label="BSSO Right")
+            plotter.add_legend()
+            plotter.camera_position = "xz"
+            plotter.background_color = "white"
+            _preview_key = f"preview_3d_{hash((_cut_args, lefort_flip, has_separate))}"
+            stpyvista(plotter, key=_preview_key)
+
+        # --- Perform cut ---
+        if perform_cut:
+            with st.spinner("Cutting bone …"):
+                result = cutter.perform_cut(*_cut_args, lefort_flip=lefort_flip)
+                st.session_state.cut_result = result
+                st.session_state.cutter = cutter
                 n_max = result["mobile_maxilla"].n_points if result["mobile_maxilla"] is not None else 0
                 n_dist = result["distal_mandible"].n_points if result["distal_mandible"] is not None else 0
-                n_rami = result["proximal_rami"].n_points if result["proximal_rami"] is not None else 0
-                st.success(
-                    f"Osteotomies complete! — "
-                    f"Upper skull: {n_skull:,} · "
-                    f"Maxilla: {n_max:,} · "
-                    f"Distal mandible: {n_dist:,} · "
-                    f"Proximal rami: {n_rami:,}"
-                )
+                st.success(f"Osteotomies complete! Maxilla: {n_max:,} · Mandible: {n_dist:,}")
                 if n_max == 0 or n_dist == 0:
                     st.warning("⚠️ A mobile segment is empty — adjust the plane positions.")
-    elif st.session_state.cut_result is not None:
-        # Re-perform cut on the fresh cutter so move_segments works
-        cutter.perform_cut(*_cut_args, lefort_flip=lefort_flip)
-        st.session_state.cutter = cutter
+        elif st.session_state.cut_result is not None:
+            cutter.perform_cut(*_cut_args, lefort_flip=lefort_flip)
+            st.session_state.cutter = cutter
 
-    # ── Guard ────────────────────────────────────────────────
-    if st.session_state.cut_result is None:
-        st.info("⬆️ Adjust planes and click **Perform Osteotomies** to continue.")
-        st.stop()
+        # ── Step 3 ────────────────────────────────────────────
+        if st.session_state.cut_result is None:
+            st.info("⬆️ Adjust planes and click **Perform Osteotomies** to continue.")
 
-    # ──────────────────────────────────────────────────────────
-    st.header("Step 3 — Move Segments")
+        if st.session_state.cut_result is not None:
+            st.header("Step 3 — Move Segments")
 
-    col_move_sliders, col_move_vis = st.columns([1, 2])
+            col_move_sliders, col_move_vis = st.columns([1, 2])
 
-    with col_move_sliders:
-        st.subheader("Advancement (mm)")
-        st.session_state.maxilla_mm = st.slider(
-            "Maxilla Advancement (Le Fort I)",
-            min_value=-15.0, max_value=15.0,
-            value=st.session_state.maxilla_mm,
-            step=0.5, key="slider_maxilla",
-        )
-        st.session_state.mandible_mm = st.slider(
-            "Distal Mandible Advancement (BSSO)",
-            min_value=-15.0, max_value=15.0,
-            value=st.session_state.mandible_mm,
-            step=0.5, key="slider_mandible",
-        )
-        move_axis = st.selectbox(
-            "Advancement direction",
-            options=[
-                "+Y (anterior)",
-                "-Y (posterior)",
-                "+X (left)",
-                "-X (right)",
-                "+Z (superior)",
-                "-Z (inferior)",
-            ],
-            index=0,
-            key="move_axis",
-        )
-        axis_vectors = {
-            "+Y (anterior)": (0.0, 1.0, 0.0),
-            "-Y (posterior)": (0.0, -1.0, 0.0),
-            "+X (left)": (1.0, 0.0, 0.0),
-            "-X (right)": (-1.0, 0.0, 0.0),
-            "+Z (superior)": (0.0, 0.0, 1.0),
-            "-Z (inferior)": (0.0, 0.0, -1.0),
-        }
-        advancement_direction = axis_vectors[move_axis]
-        st.metric("Maxilla", f"{st.session_state.maxilla_mm:+.1f} mm")
-        st.metric("Distal Mandible", f"{st.session_state.mandible_mm:+.1f} mm")
+            with col_move_sliders:
+                st.subheader("Advancement (mm)")
+                st.session_state.maxilla_mm = st.slider(
+                    "Maxilla Advancement (Le Fort I)",
+                    min_value=-15.0, max_value=15.0,
+                    value=st.session_state.maxilla_mm,
+                    step=0.5, key="slider_maxilla",
+                )
+                st.session_state.mandible_mm = st.slider(
+                    "Distal Mandible Advancement (BSSO)",
+                    min_value=-15.0, max_value=15.0,
+                    value=st.session_state.mandible_mm,
+                    step=0.5, key="slider_mandible",
+                )
+                move_axis = st.selectbox(
+                    "Advancement direction",
+                    options=["+Y (anterior)", "-Y (posterior)", "+X (left)",
+                             "-X (right)", "+Z (superior)", "-Z (inferior)"],
+                    index=0, key="move_axis",
+                )
+                axis_vectors = {
+                    "+Y (anterior)": (0.0, 1.0, 0.0),
+                    "-Y (posterior)": (0.0, -1.0, 0.0),
+                    "+X (left)": (1.0, 0.0, 0.0),
+                    "-X (right)": (-1.0, 0.0, 0.0),
+                    "+Z (superior)": (0.0, 0.0, 1.0),
+                    "-Z (inferior)": (0.0, 0.0, -1.0),
+                }
+                advancement_direction = axis_vectors[move_axis]
+                st.metric("Maxilla", f"{st.session_state.maxilla_mm:+.1f} mm")
+                st.metric("Distal Mandible", f"{st.session_state.mandible_mm:+.1f} mm")
 
-    with col_move_vis:
-        st.subheader("Post-Osteotomy Preview")
-        st.caption("🖱️ Left-drag to rotate · Right-drag to pan · Scroll to zoom")
-        moved = st.session_state.cutter.move_segments(
-            maxilla_mm=st.session_state.maxilla_mm,
-            mandible_mm=st.session_state.mandible_mm,
-            advancement_direction=advancement_direction,
-        )
-        plotter2 = pv.Plotter(window_size=(700, 500))
-        # Fixed segments (upper skull + proximal rami)
-        for seg_key, seg_color, seg_label in [
-            ("upper_skull", "ivory", "Upper Skull (fixed)"),
-            ("proximal_rami", "lightgrey", "Proximal Rami (fixed)"),
-        ]:
-            seg = moved.get(seg_key)
-            if seg is not None and seg.n_points > 0:
-                plotter2.add_mesh(seg, color=seg_color, opacity=0.5, label=seg_label)
-        # Mobile segments
-        seg_max = moved.get("mobile_maxilla")
-        if seg_max is not None and seg_max.n_points > 0:
-            plotter2.add_mesh(seg_max, color="salmon", opacity=0.9, label="Maxilla (mobile)")
-        seg_mand = moved.get("distal_mandible")
-        if seg_mand is not None and seg_mand.n_points > 0:
-            plotter2.add_mesh(seg_mand, color="cornflowerblue", opacity=0.9,
-                              label="Distal Mandible (mobile)")
-        plotter2.add_legend()
-        plotter2.camera_position = "xz"
-        plotter2.background_color = "white"
-        # Dynamic key forces re-render when slider values change
-        _move_key = f"moved_3d_{st.session_state.maxilla_mm}_{st.session_state.mandible_mm}_{move_axis}"
-        stpyvista(plotter2, key=_move_key)
+            with col_move_vis:
+                st.subheader("Post-Osteotomy Preview")
+                st.caption("🖱️ Left-drag to rotate · Right-drag to pan · Scroll to zoom")
+                moved = st.session_state.cutter.move_segments(
+                    maxilla_mm=st.session_state.maxilla_mm,
+                    mandible_mm=st.session_state.mandible_mm,
+                    advancement_direction=advancement_direction,
+                )
+                plotter2 = pv.Plotter(window_size=(700, 500))
+                for seg_key, seg_color, seg_label in [
+                    ("upper_skull", "ivory", "Upper Skull (fixed)"),
+                    ("proximal_rami", "lightgrey", "Proximal Rami (fixed)"),
+                ]:
+                    seg = moved.get(seg_key)
+                    if seg is not None and seg.n_points > 0:
+                        plotter2.add_mesh(seg, color=seg_color, opacity=0.5, label=seg_label)
+                seg_max = moved.get("mobile_maxilla")
+                if seg_max is not None and seg_max.n_points > 0:
+                    plotter2.add_mesh(seg_max, color="salmon", opacity=0.9, label="Maxilla (mobile)")
+                seg_mand = moved.get("distal_mandible")
+                if seg_mand is not None and seg_mand.n_points > 0:
+                    plotter2.add_mesh(seg_mand, color="cornflowerblue", opacity=0.9,
+                                      label="Distal Mandible (mobile)")
+                plotter2.add_legend()
+                plotter2.camera_position = "xz"
+                plotter2.background_color = "white"
+                _move_key = f"moved_3d_{st.session_state.maxilla_mm}_{st.session_state.mandible_mm}_{move_axis}"
+                stpyvista(plotter2, key=_move_key)
 
 
 # ══════════════════════════════════════════════════════════════
