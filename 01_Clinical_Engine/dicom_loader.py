@@ -194,40 +194,55 @@ LOWER_TEETH_LABELS = [
 ALL_TEETH_LABELS = UPPER_TEETH_LABELS + LOWER_TEETH_LABELS
 
 
-def nifti_to_volume(nifti_path: str) -> tuple[np.ndarray, tuple]:
-    """Load a NIfTI file in canonical RAS orientation.
+def nifti_to_volume(nifti_path: str) -> tuple[np.ndarray, tuple, np.ndarray]:
+    """Load a NIfTI file and return the volume, spacing, and affine.
 
-    Parameters
-    ----------
-    nifti_path : str
-        Path to a .nii or .nii.gz file.
+    The affine maps voxel indices to world (RAS) coordinates so the
+    mesh ends up in the correct orientation (Z = Superior = up).
 
     Returns
     -------
-    volume  : np.ndarray in canonical (X, Y, Z) axis order.
-    spacing : tuple of voxel sizes in mm for (X, Y, Z).
+    volume  : np.ndarray (i, j, k)
+    spacing : tuple of voxel sizes in mm
+    affine  : 4x4 voxel-to-world matrix
     """
     img = nib.load(nifti_path)
-    canonical = nib.as_closest_canonical(img)
-    volume = np.asarray(canonical.dataobj, dtype=np.float32)
-    spacing = tuple(float(s) for s in canonical.header.get_zooms()[:3])
-    return volume, spacing
+    volume = np.asarray(img.dataobj, dtype=np.float32)
+    spacing = tuple(float(s) for s in img.header.get_zooms()[:3])
+    affine = img.affine
+    return volume, spacing, affine
 
 
 def _volume_mask_to_mesh(
     mask: np.ndarray,
     spacing: tuple,
+    affine: np.ndarray,
     smooth_iterations: int = 30,
     decimate_fraction: float = 0.5,
 ) -> pv.PolyData:
-    """Convert a binary mask volume to a surface mesh via marching cubes."""
+    """Convert a binary mask volume to a surface mesh via marching cubes.
+
+    Applies the NIfTI affine so the mesh is in world (RAS) coordinates:
+        X = Right (+) / Left (-)
+        Y = Anterior (+) / Posterior (-)
+        Z = Superior (+) / Inferior (-)  ← UP is positive
+    """
     if mask.sum() == 0:
         return pv.PolyData()
 
     verts, faces, normals, _ = measure.marching_cubes(
         mask, level=0.5, spacing=spacing,
     )
-    mesh = pv.PolyData(verts, _faces_to_vtk(faces))
+
+    # Transform voxel-space vertices to world (RAS) coordinates
+    # verts from marching_cubes are in (i*spacing_i, j*spacing_j, k*spacing_k)
+    # We need to undo the spacing (already applied) then apply the full affine
+    verts_voxel = verts / np.array(spacing)  # back to voxel indices
+    ones = np.ones((verts_voxel.shape[0], 1))
+    verts_homo = np.hstack([verts_voxel, ones])  # Nx4
+    verts_world = (affine @ verts_homo.T).T[:, :3]  # Nx3
+
+    mesh = pv.PolyData(verts_world.astype(np.float32), _faces_to_vtk(faces))
     mesh = mesh.clean()
     if smooth_iterations > 0:
         mesh = mesh.smooth(n_iter=smooth_iterations)
@@ -259,15 +274,15 @@ def nifti_label_to_separate_meshes(
             "At least one upper or lower label must be selected."
         )
 
-    volume, spacing = nifti_to_volume(label_path)
+    volume, spacing, affine = nifti_to_volume(label_path)
     vol_int = volume.astype(int)
 
     upper_mask = np.isin(vol_int, include_upper_labels).astype(np.float32)
     lower_mask = np.isin(vol_int, include_lower_labels).astype(np.float32)
 
-    maxilla_mesh = _volume_mask_to_mesh(upper_mask, spacing,
+    maxilla_mesh = _volume_mask_to_mesh(upper_mask, spacing, affine,
                                          smooth_iterations, decimate_fraction)
-    mandible_mesh = _volume_mask_to_mesh(lower_mask, spacing,
+    mandible_mesh = _volume_mask_to_mesh(lower_mask, spacing, affine,
                                           smooth_iterations, decimate_fraction)
 
     # Combine for preview and centre both at the same origin
@@ -282,6 +297,12 @@ def nifti_label_to_separate_meshes(
     maxilla_mesh.translate(-origin, inplace=True)
     mandible_mesh.translate(-origin, inplace=True)
     combined.translate(-origin, inplace=True)
+
+    # Flip Z so Superior (up) is positive — many NIfTI files
+    # store data with Z inverted relative to display convention.
+    for m in (maxilla_mesh, mandible_mesh, combined):
+        if m.n_points > 0:
+            m.points[:, 2] *= -1
 
     return {
         "maxilla_mesh": maxilla_mesh,
@@ -321,7 +342,7 @@ def nifti_label_to_bone_mesh(
     if include_labels is None:
         include_labels = [1, 2]  # Lower + Upper Jawbone
 
-    volume, spacing = nifti_to_volume(label_path)
+    volume, spacing, affine = nifti_to_volume(label_path)
 
     # Create a binary mask of the selected labels
     mask = np.isin(volume.astype(int), include_labels).astype(np.float32)
@@ -331,22 +352,8 @@ def nifti_label_to_bone_mesh(
             f"No voxels found for labels {include_labels} in {label_path}."
         )
 
-    # Marching cubes on the binary mask
-    verts, faces, normals, _ = measure.marching_cubes(
-        mask,
-        level=0.5,
-        spacing=spacing,
-    )
-
-    mesh = pv.PolyData(verts, _faces_to_vtk(faces))
-    mesh = mesh.clean()
-
-    if smooth_iterations > 0:
-        mesh = mesh.smooth(n_iter=smooth_iterations)
-
-    if 0.0 < decimate_fraction < 1.0:
-        target_reduction = 1.0 - decimate_fraction
-        mesh = mesh.decimate(target_reduction)
+    mesh = _volume_mask_to_mesh(mask, spacing, affine,
+                                 smooth_iterations, decimate_fraction)
 
     mesh.translate(-np.array(mesh.center), inplace=True)
 
@@ -377,23 +384,13 @@ def nifti_image_to_bone_mesh(
     pv.PolyData
         Bone surface mesh.
     """
-    volume, spacing = nifti_to_volume(image_path)
+    volume, spacing, affine = nifti_to_volume(image_path)
 
-    verts, faces, normals, _ = measure.marching_cubes(
-        volume,
-        level=hu_threshold,
-        spacing=spacing,
-    )
+    # For raw images, threshold then use the same pipeline
+    mask = (volume >= hu_threshold).astype(np.float32)
 
-    mesh = pv.PolyData(verts, _faces_to_vtk(faces))
-    mesh = mesh.clean()
-
-    if smooth_iterations > 0:
-        mesh = mesh.smooth(n_iter=smooth_iterations)
-
-    if 0.0 < decimate_fraction < 1.0:
-        target_reduction = 1.0 - decimate_fraction
-        mesh = mesh.decimate(target_reduction)
+    mesh = _volume_mask_to_mesh(mask, spacing, affine,
+                                 smooth_iterations, decimate_fraction)
 
     mesh.translate(-np.array(mesh.center), inplace=True)
 

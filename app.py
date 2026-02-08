@@ -501,18 +501,10 @@ with tab_plan:
                 )
                 if n_max == 0 or n_dist == 0:
                     st.warning("⚠️ A mobile segment is empty — adjust the plane positions.")
-    elif st.session_state.cut_result is not None and st.session_state.cutter is None:
-        st.session_state.cut_result = cutter.perform_cut(*_cut_args, lefort_flip=lefort_flip)
+    elif st.session_state.cut_result is not None:
+        # Re-perform cut on the fresh cutter so move_segments works
+        cutter.perform_cut(*_cut_args, lefort_flip=lefort_flip)
         st.session_state.cutter = cutter
-        st.session_state.last_cut_signature = cut_signature
-        st.session_state.moved_signature = None
-        st.session_state.moved_segments = None
-    elif (
-        st.session_state.cut_result is not None
-        and st.session_state.last_cut_signature != cut_signature
-        and not auto_update_cut
-    ):
-        st.info("Plane settings changed. Click **Perform Osteotomies** to update segments.")
 
     # ── Guard ────────────────────────────────────────────────
     if st.session_state.cut_result is None:
@@ -566,20 +558,11 @@ with tab_plan:
     with col_move_vis:
         st.subheader("Post-Osteotomy Preview")
         st.caption("🖱️ Left-drag to rotate · Right-drag to pan · Scroll to zoom")
-        moved_signature = (
-            st.session_state.last_cut_signature,
-            st.session_state.maxilla_mm,
-            st.session_state.mandible_mm,
-            move_axis,
+        moved = st.session_state.cutter.move_segments(
+            maxilla_mm=st.session_state.maxilla_mm,
+            mandible_mm=st.session_state.mandible_mm,
+            advancement_direction=advancement_direction,
         )
-        if st.session_state.moved_signature != moved_signature:
-            st.session_state.moved_segments = st.session_state.cutter.move_segments(
-                maxilla_mm=st.session_state.maxilla_mm,
-                mandible_mm=st.session_state.mandible_mm,
-                advancement_direction=advancement_direction,
-            )
-            st.session_state.moved_signature = moved_signature
-        moved = st.session_state.moved_segments
         plotter2 = pv.Plotter(window_size=(700, 500))
         # Fixed segments (upper skull + proximal rami)
         for seg_key, seg_color, seg_label in [
@@ -601,7 +584,7 @@ with tab_plan:
         plotter2.camera_position = "xz"
         plotter2.background_color = "white"
         # Dynamic key forces re-render when slider values change
-        _move_key = f"moved_3d_{hash(moved_signature)}"
+        _move_key = f"moved_3d_{st.session_state.maxilla_mm}_{st.session_state.mandible_mm}_{move_axis}"
         stpyvista(plotter2, key=_move_key)
 
 

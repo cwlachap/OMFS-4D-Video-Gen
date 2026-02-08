@@ -23,6 +23,11 @@ _moved.png
 02_Visual_Engine/data/
 02_Visual_Engine/output/
 
+# Large model files (user downloads separately)
+gaussian_avatars_repo/
+02_Visual_Engine/flame_model/FLAME2023/*.pkl
+02_Visual_Engine/flame_model/FLAME2023/*.pdf
+
 # Output
 final_prediction.mp4
 render_frames_tmp/

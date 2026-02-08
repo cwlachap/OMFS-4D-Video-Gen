@@ -177,15 +177,15 @@ class SurgicalCutter:
             # ── Separate meshes: cut each with its own plane(s) ──
 
             # Le Fort I → cuts MAXILLA only
-            # The tooth-bearing segment (mobile) is below the cut.
-            # NIfTI Z can point either way — invert=False keeps the
-            # side in the normal direction; swap if your data has Z-down.
-            mobile_invert = bool(lefort_flip)
-            mobile_maxilla = self.maxilla.clip(
-                normal=lefort_n, origin=lefort_origin, invert=mobile_invert
-            )
+            # After Z-flip: tooth-bearing maxilla is on the negative-Z
+            # side (below), upper skull is on positive-Z (above).
+            # clip with normal=(0,0,1): invert=False keeps Z > origin (upper),
+            # invert=True keeps Z < origin (lower / tooth-bearing).
             upper_skull = self.maxilla.clip(
-                normal=lefort_n, origin=lefort_origin, invert=not mobile_invert
+                normal=lefort_n, origin=lefort_origin, invert=False
+            )
+            mobile_maxilla = self.maxilla.clip(
+                normal=lefort_n, origin=lefort_origin, invert=True
             )
 
             # BSSO → cuts MANDIBLE only

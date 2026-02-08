@@ -13,12 +13,24 @@ import numpy as np
 SCALE_FACTOR = 0.001  # mm -> FLAME internal units
 
 
-def _ensure_ffmpeg_available() -> None:
-    """Fail early if ffmpeg is not available on PATH."""
-    if shutil.which("ffmpeg") is None:
-        raise FileNotFoundError(
-            "ffmpeg not found on PATH. Install ffmpeg and restart the shell."
-        )
+def _get_ffmpeg_path() -> str:
+    """Return the path to the ffmpeg executable.
+
+    Checks in order:
+      1. imageio-ffmpeg bundled binary (pip install imageio-ffmpeg)
+      2. System PATH
+    """
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        pass
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    raise FileNotFoundError(
+        "ffmpeg not found. Install it via: pip install imageio-ffmpeg"
+    )
 
 
 def compute_offset(input_mm: float, sensitivity: float) -> float:
@@ -108,14 +120,14 @@ def render_frame(render_fn, model, flame_params: dict, frame_idx: int, output_di
 
 def stitch_video(frames_dir: str, output_path: str, fps: int = 30):
     """Use ffmpeg to stitch PNG frames into an H.264 MP4."""
-    _ensure_ffmpeg_available()
+    ffmpeg_bin = _get_ffmpeg_path()
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
     pattern = os.path.join(frames_dir, "frame_%05d.png")
     cmd = [
-        "ffmpeg",
+        ffmpeg_bin,
         "-y",
         "-framerate",
         str(fps),
