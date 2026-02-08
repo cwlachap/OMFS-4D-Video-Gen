@@ -214,8 +214,15 @@ def preprocess(
     sample = cv2.imread(os.path.join(images_dir, "00000.png"))
     h, w = sample.shape[:2]
 
-    # 2. Create FLAME params
-    create_placeholder_flame_params(num_frames, flame_path)
+    # 2. Fit FLAME params (or create placeholder if fitting fails)
+    try:
+        from flame_fitter import fit_video
+        print("[preprocess] Running FLAME fitting (GPU) …")
+        fit_video(images_dir, flame_path, device="cuda", n_iters=200)
+    except Exception as exc:
+        print(f"[preprocess] FLAME fitting failed: {exc}")
+        print("[preprocess] Creating placeholder FLAME params instead.")
+        create_placeholder_flame_params(num_frames, flame_path)
 
     # 3. Create transforms JSON
     create_transforms_json(
