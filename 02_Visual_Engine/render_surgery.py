@@ -1,25 +1,48 @@
 """
-Render a post-surgical prediction video using Gaussian Splatting + FLAME deformation.
+render_surgery.py — Render a post-surgical prediction video.
+
+Takes surgical movement values (mm) from the planning tab,
+converts them to FLAME parameter offsets, modifies the FLAME
+params in the dataset, and renders the prediction using
+GaussianAvatars.
+
+CLI Arguments:
+    --lefort_mm   : Le Fort I advancement in mm
+    --bsso_mm     : BSSO advancement in mm
+    --sensitivity : Multiplier for clinical-to-FLAME mapping
+    --model_path  : Path to trained GaussianAvatars model
+    --data_dir    : Path to preprocessed dataset
+    --output      : Output video path
+
+This script is called from app.py via subprocess.
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
 
-SCALE_FACTOR = 0.001  # mm -> FLAME internal units
+# ──────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────
+SCALE_FACTOR = 0.001  # mm → FLAME internal units
+REPO_DIR = Path(__file__).parent.parent / "gaussian_avatars_repo"
+RENDER_SCRIPT = REPO_DIR / "render.py"
+
+
+def compute_offset(input_mm: float, sensitivity: float) -> float:
+    """Convert clinical mm to FLAME-space offset."""
+    return input_mm * sensitivity * SCALE_FACTOR
 
 
 def _get_ffmpeg_path() -> str:
-    """Return the path to the ffmpeg executable.
-
-    Checks in order:
-      1. imageio-ffmpeg bundled binary (pip install imageio-ffmpeg)
-      2. System PATH
-    """
+    """Return the path to ffmpeg — bundled or system."""
     try:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
@@ -29,142 +52,204 @@ def _get_ffmpeg_path() -> str:
     if path:
         return path
     raise FileNotFoundError(
-        "ffmpeg not found. Install it via: pip install imageio-ffmpeg"
+        "ffmpeg not found. Install via: pip install imageio-ffmpeg"
     )
 
 
-def compute_offset(input_mm: float, sensitivity: float) -> float:
-    """Convert a clinical mm value to a FLAME-space offset."""
-    return input_mm * sensitivity * SCALE_FACTOR
-
-
-def load_gaussian_model(model_path: str):
-    """Load a trained 3D Gaussian Splatting model."""
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"Model checkpoint not found at: {model_path}\n"
-            "Please train the model first using train_ghost.py."
-        )
-    point_cloud_path = os.path.join(model_path, "point_cloud.ply")
-    if not os.path.isfile(point_cloud_path):
-        raise FileNotFoundError(
-            f"Model file not found: {point_cloud_path}\n"
-            "Expected a trained Gaussian checkpoint with point_cloud.ply."
-        )
-
-    try:
-        from scene import GaussianModel
-    except ImportError as exc:
-        raise ImportError(
-            "Cannot import 'scene.GaussianModel'. Ensure GaussianAvatars modules are installed."
-        ) from exc
-
-    model = GaussianModel(sh_degree=3)
-    model.load_ply(point_cloud_path)
-    return model
-
-
-def get_flame_params(data_dir: str, frame_idx: int) -> dict:
-    """Retrieve FLAME parameters for a specific frame index."""
-    params_dir = os.path.join(data_dir, "flame_params")
-    param_file = os.path.join(params_dir, f"frame_{frame_idx:05d}.npz")
-    if not os.path.exists(param_file):
-        raise FileNotFoundError(f"FLAME parameters not found: {param_file}")
-
-    data = np.load(param_file, allow_pickle=True)
-    return {
-        "jaw_pose": data["jaw_pose"].copy(),
-        "translation": data["translation"].copy(),
-        "expression": data["expression"].copy(),
-        "shape": data["shape"].copy(),
-    }
-
-
-def apply_surgical_offsets(
-    flame_params: dict,
+def modify_flame_params(
+    source_npz: str,
+    output_npz: str,
     lefort_offset: float,
     bsso_offset: float,
-) -> dict:
-    """Modify FLAME params to reflect surgical movements."""
-    modified = {k: v.copy() for k, v in flame_params.items()}
-    modified["translation"][1] += lefort_offset
-    modified["jaw_pose"][0] += bsso_offset
-    return modified
+) -> None:
+    """Create a modified FLAME parameter file with surgical offsets.
+
+    Le Fort I → shifts translation along Y (anterior advancement).
+    BSSO → modifies jaw_pose[0] (X rotation = jaw opening/advancement).
+
+    Parameters
+    ----------
+    source_npz : str
+        Original FLAME parameter file.
+    output_npz : str
+        Path to save modified parameters.
+    lefort_offset : float
+        Offset in FLAME units for maxilla advancement.
+    bsso_offset : float
+        Offset in FLAME units for mandible advancement.
+    """
+    data = dict(np.load(source_npz, allow_pickle=True))
+
+    # Le Fort I: translate maxilla anteriorly (Y-axis in FLAME space)
+    if "translation" in data:
+        trans = data["translation"].copy()
+        trans[:, 1] += lefort_offset  # Y = anterior
+        data["translation"] = trans
+
+    # BSSO: modify jaw pose (X rotation = jaw opening/advancement)
+    if "jaw_pose" in data:
+        jaw = data["jaw_pose"].copy()
+        jaw[:, 0] += bsso_offset  # X rotation
+        data["jaw_pose"] = jaw
+
+    np.savez(output_npz, **data)
+    print(f"[render_surgery] Modified FLAME params saved: {output_npz}")
+    print(f"  Le Fort offset (translation Y): {lefort_offset:.6f}")
+    print(f"  BSSO offset (jaw_pose X):       {bsso_offset:.6f}")
 
 
-def _load_render_callable():
-    """Import renderer once and return callable."""
+def create_modified_dataset(
+    data_dir: str,
+    lefort_offset: float,
+    bsso_offset: float,
+) -> str:
+    """Create a temporary dataset with modified FLAME parameters.
+
+    Copies the original dataset structure but replaces flame_param.npz
+    with modified params. Returns the path to the temp dataset.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="surgical_render_")
+
+    # Copy images (symlink to save disk space, fallback to copy)
+    src_images = os.path.join(data_dir, "images")
+    dst_images = os.path.join(temp_dir, "images")
     try:
-        from gaussian_renderer import render
-    except ImportError as exc:
-        raise ImportError(
-            "Cannot import 'gaussian_renderer.render'. "
-            "Ensure diff-gaussian-rasterization is installed."
-        ) from exc
-    return render
+        os.symlink(os.path.abspath(src_images), dst_images, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        shutil.copytree(src_images, dst_images)
+
+    # Modify FLAME params
+    src_flame = os.path.join(data_dir, "flame_param.npz")
+    dst_flame = os.path.join(temp_dir, "flame_param.npz")
+    modify_flame_params(src_flame, dst_flame, lefort_offset, bsso_offset)
+
+    # Copy and update transforms JSONs
+    for json_name in ("transforms_train.json", "transforms_test.json"):
+        src_json = os.path.join(data_dir, json_name)
+        dst_json = os.path.join(temp_dir, json_name)
+        if os.path.exists(src_json):
+            with open(src_json, "r") as f:
+                transforms = json.load(f)
+            # Update flame_param paths to point to the modified file
+            for frame in transforms.get("frames", []):
+                frame["flame_param_path"] = "flame_param.npz"
+            with open(dst_json, "w") as f:
+                json.dump(transforms, f, indent=2)
+
+    print(f"[render_surgery] Modified dataset at: {temp_dir}")
+    return temp_dir
 
 
-def render_frame(render_fn, model, flame_params: dict, frame_idx: int, output_dir: str):
-    """Deform Gaussians with FLAME params and render one frame."""
-    try:
-        import cv2
-    except ImportError as exc:
-        raise ImportError("opencv-python is required to write PNG frames.") from exc
+def render_with_gaussians(
+    model_path: str,
+    data_dir: str,
+    output_dir: str,
+    iteration: int = -1,
+) -> str:
+    """Run GaussianAvatars render.py to produce frames.
 
-    rendered_image = render_fn(model, flame_params)
-    out_path = os.path.join(output_dir, f"frame_{frame_idx:05d}.png")
-    img_np = (rendered_image.detach().cpu().numpy().transpose(1, 2, 0) * 255)
-    img_np = np.clip(img_np, 0, 255).astype(np.uint8)
-    cv2.imwrite(out_path, cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
+    Returns path to the rendered frames directory.
+    """
+    if not RENDER_SCRIPT.exists():
+        raise FileNotFoundError(
+            f"GaussianAvatars render.py not found at: {RENDER_SCRIPT}"
+        )
+
+    cmd = [
+        sys.executable,
+        str(RENDER_SCRIPT),
+        "--source_path", os.path.abspath(data_dir),
+        "--model_path", os.path.abspath(model_path),
+        "--bind_to_mesh",
+        "--skip_val",
+        "--skip_test",
+    ]
+    if iteration > 0:
+        cmd.extend(["--iteration", str(iteration)])
+
+    print(f"[render_surgery] Rendering with GaussianAvatars...")
+    print(f"  Command: {' '.join(cmd)}")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO_DIR) + os.pathsep + env.get("PYTHONPATH", "")
+
+    result = subprocess.run(
+        cmd,
+        cwd=str(REPO_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Rendering failed:\n{result.stderr[-2000:]}"
+        )
+
+    # Find the rendered frames
+    # GaussianAvatars outputs to model_path/train/ours_XXXXX/renders/
+    renders_dir = None
+    train_dir = os.path.join(model_path, "train")
+    if os.path.isdir(train_dir):
+        for d in sorted(os.listdir(train_dir), reverse=True):
+            renders = os.path.join(train_dir, d, "renders")
+            if os.path.isdir(renders):
+                renders_dir = renders
+                break
+
+    if renders_dir is None:
+        raise FileNotFoundError(
+            "No rendered frames found after GaussianAvatars rendering."
+        )
+
+    print(f"[render_surgery] Frames rendered to: {renders_dir}")
+    return renders_dir
 
 
 def stitch_video(frames_dir: str, output_path: str, fps: int = 30):
-    """Use ffmpeg to stitch PNG frames into an H.264 MP4."""
+    """Stitch PNG frames into H.264 MP4 using ffmpeg."""
     ffmpeg_bin = _get_ffmpeg_path()
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    pattern = os.path.join(frames_dir, "frame_%05d.png")
+    # Get list of frame files
+    frames = sorted([f for f in os.listdir(frames_dir) if f.endswith(".png")])
+    if not frames:
+        raise FileNotFoundError(f"No PNG frames in {frames_dir}")
+
+    # Rename frames to sequential pattern for ffmpeg
+    temp_frames = tempfile.mkdtemp(prefix="stitch_")
+    for i, fname in enumerate(frames):
+        src = os.path.join(frames_dir, fname)
+        dst = os.path.join(temp_frames, f"frame_{i:05d}.png")
+        shutil.copy2(src, dst)
+
+    pattern = os.path.join(temp_frames, "frame_%05d.png")
     cmd = [
-        ffmpeg_bin,
-        "-y",
-        "-framerate",
-        str(fps),
-        "-i",
-        pattern,
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-preset",
-        "medium",
-        "-crf",
-        "18",
+        ffmpeg_bin, "-y",
+        "-framerate", str(fps),
+        "-i", pattern,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "medium",
+        "-crf", "18",
         output_path,
     ]
+
     result = subprocess.run(cmd, capture_output=True, text=True)
+    shutil.rmtree(temp_frames, ignore_errors=True)
+
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed:\n{result.stderr}")
+
     print(f"[render_surgery] Video saved to {output_path}")
 
 
-def _validate_inputs(args: argparse.Namespace) -> None:
-    if args.fps <= 0:
-        raise ValueError("--fps must be > 0.")
-    if args.sensitivity < 0:
-        raise ValueError("--sensitivity must be >= 0.")
-    if not os.path.isdir(args.data_dir):
-        raise FileNotFoundError(f"Data directory not found: {args.data_dir}")
-    params_dir = os.path.join(args.data_dir, "flame_params")
-    if not os.path.isdir(params_dir):
-        raise FileNotFoundError(f"FLAME params directory not found: {params_dir}")
-    if not list(Path(params_dir).glob("frame_*.npz")):
-        raise FileNotFoundError("No FLAME parameter files found.")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Render post-surgical prediction video.")
+    parser = argparse.ArgumentParser(
+        description="Render post-surgical prediction video."
+    )
     parser.add_argument("--lefort_mm", type=float, required=True)
     parser.add_argument("--bsso_mm", type=float, required=True)
     parser.add_argument("--sensitivity", type=float, default=1.0)
@@ -174,35 +259,30 @@ def main():
     parser.add_argument("--fps", type=int, default=30)
     args = parser.parse_args()
 
-    _validate_inputs(args)
+    # Compute FLAME offsets
     lefort_offset = compute_offset(args.lefort_mm, args.sensitivity)
     bsso_offset = compute_offset(args.bsso_mm, args.sensitivity)
-    print(f"[render_surgery] Le Fort offset : {lefort_offset:.6f}")
-    print(f"[render_surgery] BSSO offset    : {bsso_offset:.6f}")
 
-    model = load_gaussian_model(args.model_path)
-    render_fn = _load_render_callable()
+    print(f"[render_surgery] Le Fort: {args.lefort_mm} mm → offset {lefort_offset:.6f}")
+    print(f"[render_surgery] BSSO:    {args.bsso_mm} mm → offset {bsso_offset:.6f}")
 
-    params_dir = os.path.join(args.data_dir, "flame_params")
-    frame_files = sorted(Path(params_dir).glob("frame_*.npz"))
-    num_frames = len(frame_files)
-    print(f"[render_surgery] Rendering {num_frames} frames ...")
-
-    output_dir = os.path.dirname(args.output)
-    frames_dir = os.path.join(output_dir if output_dir else ".", "render_frames_tmp")
-    os.makedirs(frames_dir, exist_ok=True)
+    # Create modified dataset with surgical offsets
+    modified_dir = create_modified_dataset(
+        args.data_dir, lefort_offset, bsso_offset
+    )
 
     try:
-        for idx in range(num_frames):
-            flame_params = get_flame_params(args.data_dir, idx)
-            modified = apply_surgical_offsets(flame_params, lefort_offset, bsso_offset)
-            render_frame(render_fn, model, modified, idx, frames_dir)
-            if (idx + 1) % 50 == 0 or idx == num_frames - 1:
-                print(f"  ... rendered {idx + 1}/{num_frames}")
+        # Render frames
+        frames_dir = render_with_gaussians(
+            args.model_path, modified_dir
+        )
 
+        # Stitch into video
         stitch_video(frames_dir, args.output, fps=args.fps)
+
     finally:
-        shutil.rmtree(frames_dir, ignore_errors=True)
+        # Clean up temp dataset
+        shutil.rmtree(modified_dir, ignore_errors=True)
 
     print("[render_surgery] Done.")
 

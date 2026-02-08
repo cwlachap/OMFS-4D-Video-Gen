@@ -606,8 +606,8 @@ with tab_predict:
 
     st.divider()
 
-    # ── Video Input ──────────────────────────────────────────
-    st.subheader("1. Patient Video")
+    # ── Step 1: Video Input ─────────────────────────────────
+    st.subheader("1. Upload Patient Video")
     uploaded_video = st.file_uploader(
         "Upload patient video (.mp4)",
         type=["mp4", "avi", "mov"],
@@ -624,43 +624,116 @@ with tab_predict:
 
     st.divider()
 
-    # ── Train Model ──────────────────────────────────────────
-    st.subheader("2. Train Gaussian Avatar Model")
+    # ── Step 2: Preprocess Video ─────────────────────────────
+    st.subheader("2. Preprocess Video (Extract Frames + FLAME Params)")
+    st.markdown(
+        "Extracts frames from the video and creates the dataset structure "
+        "needed for GaussianAvatars training."
+    )
+    col_prep1, col_prep2 = st.columns(2)
+    with col_prep1:
+        max_frames = st.number_input(
+            "Max frames to extract",
+            min_value=10, max_value=2000,
+            value=300, step=50,
+            key="max_frames",
+            help="More frames = better quality but longer training. 300 is a good start.",
+        )
+    with col_prep2:
+        target_size = st.selectbox(
+            "Frame resolution",
+            options=[256, 512, 768, 1024],
+            index=1,
+            key="target_size",
+        )
+
+    transforms_path = os.path.join(data_dir, "transforms_train.json")
+    dataset_ready = os.path.exists(transforms_path)
+
+    if dataset_ready:
+        st.success("Dataset already preprocessed. Re-run to update.")
+
+    if st.button("📹 Preprocess Video", key="preprocess", type="secondary"):
+        if not os.path.exists(input_video_path):
+            st.error("Upload a video first (Step 1).")
+        else:
+            preprocess_cmd = [
+                VISUAL_PYTHON_PATH,
+                str(VISUAL_DIR / "preprocess_video.py"),
+                "--video", input_video_path,
+                "--output_dir", data_dir,
+                "--max_frames", str(max_frames),
+                "--target_size", str(target_size),
+            ]
+            st.info(f"Running: `{' '.join(preprocess_cmd)}`")
+            with st.spinner(f"Extracting up to {max_frames} frames …"):
+                result = subprocess.run(
+                    preprocess_cmd,
+                    capture_output=True, text=True,
+                    cwd=str(PROJECT_ROOT),
+                )
+            if result.returncode == 0:
+                st.success("Preprocessing complete!")
+                st.code(result.stdout[-2000:] if len(result.stdout) > 2000
+                        else result.stdout)
+                dataset_ready = True
+            else:
+                st.error("Preprocessing failed.")
+                st.code(result.stderr[-2000:] if len(result.stderr) > 2000
+                        else result.stderr)
+
+    st.divider()
+
+    # ── Step 3: Train Model ──────────────────────────────────
+    st.subheader("3. Train Gaussian Avatar Model")
     model_output_dir = str(VISUAL_DIR / "output" / "model")
+    iterations = st.number_input(
+        "Training iterations",
+        min_value=1000, max_value=600000,
+        value=30000, step=5000,
+        key="train_iterations",
+        help="30K = quick test (~30 min), 600K = full quality (~8 hrs on RTX 4070 Ti).",
+    )
+
     if st.button("🧠 Train Model", key="train_model", type="secondary"):
-        if not os.path.exists(VISUAL_PYTHON_PATH):
-            st.error(
-                f"❌ Visual Python not found at:\n`{VISUAL_PYTHON_PATH}`\n\n"
-                "Please update `VISUAL_PYTHON_PATH` in `app.py` to point to "
-                "your `omfs_visual` conda environment's python.exe."
-            )
-        elif not os.path.exists(input_video_path):
-            st.error("No input video found. Upload a patient video in Step 1 first.")
+        if not dataset_ready:
+            st.error("Preprocess the video first (Step 2).")
         else:
             train_cmd = [
                 VISUAL_PYTHON_PATH,
                 str(VISUAL_DIR / "train_ghost.py"),
                 "--data_dir", data_dir,
                 "--output_dir", model_output_dir,
+                "--iterations", str(iterations),
             ]
-            run_external_command(
-                cmd=train_cmd,
-                spinner_text="Training model … (this may take hours)",
-                success_text="Training complete!",
-                failure_text="Training failed.",
-            )
+            st.info(f"Running: `{' '.join(train_cmd)}`")
+            with st.spinner(f"Training model for {iterations:,} iterations … (this will take a while)"):
+                result = subprocess.run(
+                    train_cmd,
+                    capture_output=True, text=True,
+                    cwd=str(PROJECT_ROOT),
+                )
+            if result.returncode == 0:
+                st.success("Training complete!")
+                st.code(result.stdout[-2000:] if len(result.stdout) > 2000
+                        else result.stdout)
+            else:
+                st.error("Training failed.")
+                st.code(result.stderr[-2000:] if len(result.stderr) > 2000
+                        else result.stderr)
 
     st.divider()
 
-    # ── Generate Prediction ──────────────────────────────────
-    st.subheader("3. Generate Prediction from Surgical Plan")
+    # ── Step 4: Generate Prediction ──────────────────────────
+    st.subheader("4. Generate Prediction from Surgical Plan")
 
     sensitivity = st.slider(
         "Sensitivity Multiplier",
         min_value=0.1, max_value=3.0,
         value=1.0, step=0.1,
         key="sensitivity",
-        help="Controls how strongly the mm values map to facial change.",
+        help="Controls how strongly the mm values map to facial change. "
+             "1.0 = direct mapping. Increase if effect is too subtle.",
     )
 
     output_video_path = str(PROJECT_ROOT / "final_prediction.mp4")
@@ -678,17 +751,8 @@ with tab_predict:
                 "Both advancement values are 0.0 mm. "
                 "Go to the Planning tab and set the movement sliders first."
             )
-        elif not os.path.exists(VISUAL_PYTHON_PATH):
-            st.error(
-                f"❌ Visual Python not found at:\n`{VISUAL_PYTHON_PATH}`\n\n"
-                "Please update `VISUAL_PYTHON_PATH` in `app.py`."
-            )
-        elif not os.path.exists(input_video_path):
-            st.error("No pre-op video found. Upload a video in Step 1 first.")
-        elif not os.path.exists(os.path.join(model_output_dir, "point_cloud.ply")):
-            st.error(
-                "No trained model checkpoint found. Train the model first (Step 2)."
-            )
+        elif not dataset_ready:
+            st.error("Preprocess the video first (Step 2).")
         else:
             render_cmd = [
                 VISUAL_PYTHON_PATH,
@@ -700,16 +764,25 @@ with tab_predict:
                 "--data_dir", data_dir,
                 "--output", output_video_path,
             ]
-            run_external_command(
-                cmd=render_cmd,
-                spinner_text="Rendering prediction video …",
-                success_text="Prediction rendered successfully!",
-                failure_text="Rendering failed.",
-            )
+            st.info(f"Running: `{' '.join(render_cmd)}`")
+            with st.spinner("Rendering prediction video …"):
+                result = subprocess.run(
+                    render_cmd,
+                    capture_output=True, text=True,
+                    cwd=str(PROJECT_ROOT),
+                )
+            if result.returncode == 0:
+                st.success("Prediction rendered successfully!")
+                st.code(result.stdout[-2000:] if len(result.stdout) > 2000
+                        else result.stdout)
+            else:
+                st.error("Rendering failed.")
+                st.code(result.stderr[-2000:] if len(result.stderr) > 2000
+                        else result.stderr)
 
-    # ── Side-by-side video display ───────────────────────────
+    # ── Step 5: Side-by-side Results ─────────────────────────
     st.divider()
-    st.subheader("4. Results — Before vs After")
+    st.subheader("5. Results — Before vs After")
 
     col_pre, col_post = st.columns(2)
 

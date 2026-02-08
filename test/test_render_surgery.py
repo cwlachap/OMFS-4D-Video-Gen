@@ -4,11 +4,11 @@ import sys
 import os
 import unittest
 
-# Ensure the Visual Engine module is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "02_Visual_Engine"))
 
-from render_surgery import compute_offset, apply_surgical_offsets, SCALE_FACTOR
+from render_surgery import compute_offset, modify_flame_params, SCALE_FACTOR
 import numpy as np
+import tempfile
 
 
 class TestComputeOffset(unittest.TestCase):
@@ -36,43 +36,39 @@ class TestComputeOffset(unittest.TestCase):
         self.assertEqual(compute_offset(10.0, 0.0), 0.0)
 
 
-class TestApplySurgicalOffsets(unittest.TestCase):
-    """Tests for apply_surgical_offsets."""
+class TestModifyFlameParams(unittest.TestCase):
+    """Tests for modify_flame_params."""
 
-    def _make_params(self):
-        return {
-            "jaw_pose": np.array([0.0, 0.0, 0.0]),
-            "translation": np.array([0.0, 0.0, 0.0]),
-            "expression": np.zeros(10),
-            "shape": np.zeros(10),
-        }
+    def setUp(self):
+        """Create a temp FLAME param file."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.source_path = os.path.join(self.temp_dir, "source.npz")
+        self.output_path = os.path.join(self.temp_dir, "modified.npz")
+        np.savez(self.source_path,
+                 jaw_pose=np.zeros((10, 3), dtype=np.float32),
+                 translation=np.zeros((10, 3), dtype=np.float32),
+                 expr=np.zeros((10, 100), dtype=np.float32),
+                 shape=np.zeros(300, dtype=np.float32))
 
-    def test_lefort_offset_modifies_translation_y(self):
-        params = self._make_params()
-        modified = apply_surgical_offsets(params, lefort_offset=0.005, bsso_offset=0.0)
-        self.assertAlmostEqual(modified["translation"][1], 0.005)
-        # Original should be unchanged
-        self.assertAlmostEqual(params["translation"][1], 0.0)
+    def test_lefort_modifies_translation_y(self):
+        modify_flame_params(self.source_path, self.output_path, 0.005, 0.0)
+        data = np.load(self.output_path)
+        self.assertAlmostEqual(float(data["translation"][0, 1]), 0.005, places=5)
 
-    def test_bsso_offset_modifies_jaw_pose_x(self):
-        params = self._make_params()
-        modified = apply_surgical_offsets(params, lefort_offset=0.0, bsso_offset=0.003)
-        self.assertAlmostEqual(modified["jaw_pose"][0], 0.003)
-        self.assertAlmostEqual(params["jaw_pose"][0], 0.0)
+    def test_bsso_modifies_jaw_pose_x(self):
+        modify_flame_params(self.source_path, self.output_path, 0.0, 0.003)
+        data = np.load(self.output_path)
+        self.assertAlmostEqual(float(data["jaw_pose"][0, 0]), 0.003, places=5)
 
-    def test_combined_offsets(self):
-        params = self._make_params()
-        modified = apply_surgical_offsets(params, lefort_offset=0.01, bsso_offset=0.02)
-        self.assertAlmostEqual(modified["translation"][1], 0.01)
-        self.assertAlmostEqual(modified["jaw_pose"][0], 0.02)
+    def test_does_not_mutate_source(self):
+        modify_flame_params(self.source_path, self.output_path, 0.01, 0.02)
+        source = np.load(self.source_path)
+        self.assertAlmostEqual(float(source["translation"][0, 1]), 0.0)
+        self.assertAlmostEqual(float(source["jaw_pose"][0, 0]), 0.0)
 
-    def test_does_not_mutate_input(self):
-        params = self._make_params()
-        original_jaw = params["jaw_pose"].copy()
-        original_trans = params["translation"].copy()
-        apply_surgical_offsets(params, lefort_offset=0.1, bsso_offset=0.2)
-        np.testing.assert_array_equal(params["jaw_pose"], original_jaw)
-        np.testing.assert_array_equal(params["translation"], original_trans)
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

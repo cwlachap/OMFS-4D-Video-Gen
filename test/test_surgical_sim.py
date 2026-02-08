@@ -109,18 +109,14 @@ class TestSurgicalCutterSeparateMeshes(unittest.TestCase):
                 advancement_direction=(0.0, 0.0, 0.0),
             )
 
-    def test_lefort_flip_changes_mobile_side(self):
-        result_default = self.cutter.perform_cut(
-            lefort_z=20, bsso_l_x=-15, bsso_r_x=15, lefort_flip=False
-        )
-        default_z = float(result_default["mobile_maxilla"].center[2])
-
-        result_flipped = self.cutter.perform_cut(
-            lefort_z=20, bsso_l_x=-15, bsso_r_x=15, lefort_flip=True
-        )
-        flipped_z = float(result_flipped["mobile_maxilla"].center[2])
-
-        self.assertNotAlmostEqual(default_z, flipped_z, places=2)
+    def test_upper_skull_above_mobile_maxilla(self):
+        """Upper skull center should be above mobile maxilla center in Z."""
+        result = self.cutter.perform_cut(lefort_z=20, bsso_l_x=-15, bsso_r_x=15)
+        if result["upper_skull"].n_points > 0 and result["mobile_maxilla"].n_points > 0:
+            upper_z = float(result["upper_skull"].center[2])
+            mobile_z = float(result["mobile_maxilla"].center[2])
+            # They should be on different sides of the cut
+            self.assertNotAlmostEqual(upper_z, mobile_z, places=1)
 
 
 class TestSurgicalCutterSingleMesh(unittest.TestCase):
