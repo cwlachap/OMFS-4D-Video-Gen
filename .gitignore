@@ -1,0 +1,28 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+
+# Temp files
+_preview.png
+_moved.png
+*.tmp
+
+# Data (user provides)
+01_Clinical_Engine/weights/
+01_Clinical_Engine/temp_data/
+02_Visual_Engine/data/
+02_Visual_Engine/output/
+
+# Output
+final_prediction.mp4
+render_frames_tmp/
