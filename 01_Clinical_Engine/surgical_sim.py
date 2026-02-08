@@ -47,6 +47,15 @@ def _angle_to_normal(base_normal: tuple, pitch_deg: float, yaw_deg: float) -> tu
     return tuple(rotated / length)
 
 
+def _normalise_direction(direction: tuple[float, float, float]) -> np.ndarray:
+    """Return a unit direction vector; fail fast for near-zero vectors."""
+    vec = np.array(direction, dtype=float)
+    length = np.linalg.norm(vec)
+    if length < 1e-12:
+        raise ValueError("advancement_direction must be a non-zero vector.")
+    return vec / length
+
+
 class SurgicalCutter:
     """Cuts separate maxilla and mandible meshes with 3 planes.
 
@@ -141,6 +150,7 @@ class SurgicalCutter:
         bsso_l_yaw: float = 0.0,
         bsso_r_pitch: float = 0.0,
         bsso_r_yaw: float = 0.0,
+        lefort_flip: bool = False,
     ) -> dict:
         """Cut the maxilla and mandible into 4 segments.
 
@@ -170,11 +180,12 @@ class SurgicalCutter:
             # The tooth-bearing segment (mobile) is below the cut.
             # NIfTI Z can point either way — invert=False keeps the
             # side in the normal direction; swap if your data has Z-down.
+            mobile_invert = bool(lefort_flip)
             mobile_maxilla = self.maxilla.clip(
-                normal=lefort_n, origin=lefort_origin, invert=False
+                normal=lefort_n, origin=lefort_origin, invert=mobile_invert
             )
             upper_skull = self.maxilla.clip(
-                normal=lefort_n, origin=lefort_origin, invert=True
+                normal=lefort_n, origin=lefort_origin, invert=not mobile_invert
             )
 
             # BSSO → cuts MANDIBLE only
@@ -204,11 +215,12 @@ class SurgicalCutter:
         else:
             # ── Single mesh fallback ──
             # Le Fort
+            mobile_invert = bool(lefort_flip)
             upper_skull = self.maxilla.clip(
-                normal=lefort_n, origin=lefort_origin, invert=False
+                normal=lefort_n, origin=lefort_origin, invert=not mobile_invert
             )
             below = self.maxilla.clip(
-                normal=lefort_n, origin=lefort_origin, invert=True
+                normal=lefort_n, origin=lefort_origin, invert=mobile_invert
             )
             # Treat everything below Le Fort as mobile maxilla
             mobile_maxilla = below
@@ -251,8 +263,9 @@ class SurgicalCutter:
         self,
         maxilla_mm: float = 0.0,
         mandible_mm: float = 0.0,
+        advancement_direction: tuple[float, float, float] = (0.0, 1.0, 0.0),
     ) -> dict:
-        """Translate mobile segments along Y-axis (anterior = +Y).
+        """Translate mobile segments along a configured advancement direction.
 
         maxilla_mm  moves ONLY the mobile maxilla.
         mandible_mm moves ONLY the distal mandible.
@@ -261,11 +274,12 @@ class SurgicalCutter:
         if self.mobile_maxilla is None or self.distal_mandible is None:
             raise RuntimeError("Call perform_cut() before move_segments().")
 
+        adv_dir = _normalise_direction(advancement_direction)
         moved_maxilla = self.mobile_maxilla.copy()
         moved_mandible = self.distal_mandible.copy()
 
-        moved_maxilla.translate((0, maxilla_mm, 0), inplace=True)
-        moved_mandible.translate((0, mandible_mm, 0), inplace=True)
+        moved_maxilla.translate(tuple(adv_dir * maxilla_mm), inplace=True)
+        moved_mandible.translate(tuple(adv_dir * mandible_mm), inplace=True)
 
         return {
             "upper_skull": self.upper_skull,

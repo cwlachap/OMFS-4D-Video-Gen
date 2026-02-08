@@ -87,6 +87,41 @@ class TestSurgicalCutterSeparateMeshes(unittest.TestCase):
             rami_orig, np.array(moved["proximal_rami"].center)
         )
 
+    def test_move_segments_supports_custom_direction(self):
+        self.cutter.perform_cut(lefort_z=20, bsso_l_x=-15, bsso_r_x=15)
+        max_orig = np.array(self.cutter.mobile_maxilla.center)
+        moved = self.cutter.move_segments(
+            maxilla_mm=5.0,
+            mandible_mm=0.0,
+            advancement_direction=(1.0, 0.0, 0.0),
+        )
+        delta = np.array(moved["mobile_maxilla"].center) - max_orig
+        self.assertAlmostEqual(delta[0], 5.0, places=1)
+        self.assertAlmostEqual(delta[1], 0.0, places=1)
+        self.assertAlmostEqual(delta[2], 0.0, places=1)
+
+    def test_move_segments_rejects_zero_direction(self):
+        self.cutter.perform_cut(lefort_z=20, bsso_l_x=-15, bsso_r_x=15)
+        with self.assertRaises(ValueError):
+            self.cutter.move_segments(
+                maxilla_mm=1.0,
+                mandible_mm=1.0,
+                advancement_direction=(0.0, 0.0, 0.0),
+            )
+
+    def test_lefort_flip_changes_mobile_side(self):
+        result_default = self.cutter.perform_cut(
+            lefort_z=20, bsso_l_x=-15, bsso_r_x=15, lefort_flip=False
+        )
+        default_z = float(result_default["mobile_maxilla"].center[2])
+
+        result_flipped = self.cutter.perform_cut(
+            lefort_z=20, bsso_l_x=-15, bsso_r_x=15, lefort_flip=True
+        )
+        flipped_z = float(result_flipped["mobile_maxilla"].center[2])
+
+        self.assertNotAlmostEqual(default_z, flipped_z, places=2)
+
 
 class TestSurgicalCutterSingleMesh(unittest.TestCase):
     """Tests with a single combined mesh (fallback mode)."""

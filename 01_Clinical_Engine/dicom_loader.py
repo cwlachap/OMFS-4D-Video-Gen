@@ -22,6 +22,15 @@ import pyvista as pv
 from skimage import measure
 
 
+def _faces_to_vtk(faces: np.ndarray) -> np.ndarray:
+    """Convert Nx3 triangle indices into VTK face-array format."""
+    n_faces = len(faces)
+    return np.column_stack([
+        np.full(n_faces, 3, dtype=np.int64),
+        faces.astype(np.int64),
+    ]).ravel()
+
+
 def load_dicom_volume(dicom_path: str) -> tuple[np.ndarray, tuple]:
     """Load a DICOM series from a folder and return the 3D volume in HU.
 
@@ -136,15 +145,10 @@ def dicom_to_bone_mesh(
         spacing=spacing,
     )
 
-    # Convert to PyVista PolyData
-    # faces need to be in VTK format: [n_pts, v0, v1, v2, ...]
-    n_faces = len(faces)
-    vtk_faces = np.column_stack([
-        np.full(n_faces, 3, dtype=np.int64),
-        faces.astype(np.int64),
-    ]).ravel()
-
-    mesh = pv.PolyData(verts, vtk_faces)
+    # Marching-cubes vertices come out as (z, y, x) for a (Z, Y, X) volume.
+    # Reorder to anatomical-style Cartesian (x, y, z).
+    verts_xyz = np.column_stack((verts[:, 2], verts[:, 1], verts[:, 0]))
+    mesh = pv.PolyData(verts_xyz, _faces_to_vtk(faces))
 
     # Clean up
     mesh = mesh.clean()
@@ -191,7 +195,7 @@ ALL_TEETH_LABELS = UPPER_TEETH_LABELS + LOWER_TEETH_LABELS
 
 
 def nifti_to_volume(nifti_path: str) -> tuple[np.ndarray, tuple]:
-    """Load a NIfTI file and return the 3D volume + voxel spacing.
+    """Load a NIfTI file in canonical RAS orientation.
 
     Parameters
     ----------
@@ -200,12 +204,13 @@ def nifti_to_volume(nifti_path: str) -> tuple[np.ndarray, tuple]:
 
     Returns
     -------
-    volume  : np.ndarray (Z, Y, X) or (X, Y, Z) depending on orientation.
-    spacing : tuple of voxel sizes in mm.
+    volume  : np.ndarray in canonical (X, Y, Z) axis order.
+    spacing : tuple of voxel sizes in mm for (X, Y, Z).
     """
     img = nib.load(nifti_path)
-    volume = np.asarray(img.dataobj, dtype=np.float32)
-    spacing = tuple(float(s) for s in img.header.get_zooms()[:3])
+    canonical = nib.as_closest_canonical(img)
+    volume = np.asarray(canonical.dataobj, dtype=np.float32)
+    spacing = tuple(float(s) for s in canonical.header.get_zooms()[:3])
     return volume, spacing
 
 
@@ -222,13 +227,7 @@ def _volume_mask_to_mesh(
     verts, faces, normals, _ = measure.marching_cubes(
         mask, level=0.5, spacing=spacing,
     )
-    n_faces = len(faces)
-    vtk_faces = np.column_stack([
-        np.full(n_faces, 3, dtype=np.int64),
-        faces.astype(np.int64),
-    ]).ravel()
-
-    mesh = pv.PolyData(verts, vtk_faces)
+    mesh = pv.PolyData(verts, _faces_to_vtk(faces))
     mesh = mesh.clean()
     if smooth_iterations > 0:
         mesh = mesh.smooth(n_iter=smooth_iterations)
@@ -255,6 +254,10 @@ def nifti_label_to_separate_meshes(
         include_upper_labels = [2] + UPPER_TEETH_LABELS
     if include_lower_labels is None:
         include_lower_labels = [1] + LOWER_TEETH_LABELS
+    if not include_upper_labels and not include_lower_labels:
+        raise ValueError(
+            "At least one upper or lower label must be selected."
+        )
 
     volume, spacing = nifti_to_volume(label_path)
     vol_int = volume.astype(int)
@@ -335,13 +338,7 @@ def nifti_label_to_bone_mesh(
         spacing=spacing,
     )
 
-    n_faces = len(faces)
-    vtk_faces = np.column_stack([
-        np.full(n_faces, 3, dtype=np.int64),
-        faces.astype(np.int64),
-    ]).ravel()
-
-    mesh = pv.PolyData(verts, vtk_faces)
+    mesh = pv.PolyData(verts, _faces_to_vtk(faces))
     mesh = mesh.clean()
 
     if smooth_iterations > 0:
@@ -388,13 +385,7 @@ def nifti_image_to_bone_mesh(
         spacing=spacing,
     )
 
-    n_faces = len(faces)
-    vtk_faces = np.column_stack([
-        np.full(n_faces, 3, dtype=np.int64),
-        faces.astype(np.int64),
-    ]).ravel()
-
-    mesh = pv.PolyData(verts, vtk_faces)
+    mesh = pv.PolyData(verts, _faces_to_vtk(faces))
     mesh = mesh.clean()
 
     if smooth_iterations > 0:

@@ -61,6 +61,56 @@ if "cut_result" not in st.session_state:
     st.session_state.cut_result = None
 if "cutter" not in st.session_state:
     st.session_state.cutter = None
+if "last_cut_signature" not in st.session_state:
+    st.session_state.last_cut_signature = None
+if "preview_signature" not in st.session_state:
+    st.session_state.preview_signature = None
+if "preview_planes" not in st.session_state:
+    st.session_state.preview_planes = None
+if "moved_signature" not in st.session_state:
+    st.session_state.moved_signature = None
+if "moved_segments" not in st.session_state:
+    st.session_state.moved_segments = None
+
+
+def reset_clinical_state() -> None:
+    """Reset loaded meshes and derived cutting/movement state."""
+    st.session_state.maxilla_mesh = None
+    st.session_state.mandible_mesh = None
+    st.session_state.cut_result = None
+    st.session_state.cutter = None
+    st.session_state.last_cut_signature = None
+    st.session_state.preview_signature = None
+    st.session_state.preview_planes = None
+    st.session_state.moved_signature = None
+    st.session_state.moved_segments = None
+
+
+def run_external_command(
+    cmd: list[str],
+    spinner_text: str,
+    success_text: str,
+    failure_text: str,
+) -> None:
+    """Run a subprocess and render concise stdout/stderr diagnostics."""
+    st.info(f"Running: `{' '.join(cmd)}`")
+    with st.spinner(spinner_text):
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(PROJECT_ROOT),
+        )
+
+    if result.returncode == 0:
+        st.success(success_text)
+        if result.stdout:
+            st.code(result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout)
+    else:
+        st.error(failure_text)
+        payload = result.stderr or result.stdout
+        if payload:
+            st.code(payload[-2000:] if len(payload) > 2000 else payload)
 
 # ──────────────────────────────────────────────────────────────
 # Page Config
@@ -102,6 +152,7 @@ with tab_plan:
                 tmp.write(uploaded_mesh_file.getvalue())
                 tmp_path = tmp.name
             st.session_state.skull_mesh = pv.read(tmp_path)
+            reset_clinical_state()
             os.unlink(tmp_path)
             st.success(
                 f"Mesh loaded: {st.session_state.skull_mesh.n_points:,} points"
@@ -112,6 +163,7 @@ with tab_plan:
             demo = pv.Sphere(radius=80, center=(0, 0, 0), theta_resolution=60,
                              phi_resolution=60)
             st.session_state.skull_mesh = demo
+            reset_clinical_state()
             st.success("Demo sphere loaded.")
 
     # ── DICOM Upload ────────────────────────────────────────
@@ -165,6 +217,7 @@ with tab_plan:
                     smooth_iterations=smooth_iters,
                 )
                 st.session_state.skull_mesh = mesh
+                reset_clinical_state()
                 st.success(
                     f"Bone mesh extracted: "
                     f"{mesh.n_points:,} vertices, "
@@ -211,14 +264,16 @@ with tab_plan:
         with col_lab3:
             inc_teeth = st.checkbox("Teeth (all)", value=True, key="inc_teeth")
 
-        label_ids = []
+        upper_label_ids = []
+        lower_label_ids = []
         if inc_lower:
-            label_ids.append(1)
+            lower_label_ids.append(1)
         if inc_upper:
-            label_ids.append(2)
+            upper_label_ids.append(2)
         if inc_teeth:
-            from dicom_loader import ALL_TEETH_LABELS
-            label_ids.extend(ALL_TEETH_LABELS)
+            from dicom_loader import LOWER_TEETH_LABELS, UPPER_TEETH_LABELS
+            upper_label_ids.extend(UPPER_TEETH_LABELS)
+            lower_label_ids.extend(LOWER_TEETH_LABELS)
 
     if nifti_path and st.button("🦴 Load NIfTI Bone Mesh", key="run_nifti"):
         if not os.path.isfile(nifti_path):
@@ -228,15 +283,21 @@ with tab_plan:
                 try:
                     if nifti_mode == "Label file (pre-segmented — recommended)":
                         from dicom_loader import nifti_label_to_separate_meshes
+                        if not upper_label_ids and not lower_label_ids:
+                            raise ValueError(
+                                "No labels selected. Enable at least one jaw or teeth set."
+                            )
                         meshes = nifti_label_to_separate_meshes(
                             nifti_path,
+                            include_upper_labels=upper_label_ids,
+                            include_lower_labels=lower_label_ids,
                             smooth_iterations=30,
                             decimate_fraction=0.5,
                         )
+                        reset_clinical_state()
                         st.session_state.maxilla_mesh = meshes["maxilla_mesh"]
                         st.session_state.mandible_mesh = meshes["mandible_mesh"]
                         st.session_state.skull_mesh = meshes["combined_mesh"]
-                        st.session_state.cut_result = None
                         n_max = meshes["maxilla_mesh"].n_points
                         n_man = meshes["mandible_mesh"].n_points
                         st.success(
@@ -252,10 +313,8 @@ with tab_plan:
                             smooth_iterations=30,
                             decimate_fraction=0.5,
                         )
+                        reset_clinical_state()
                         st.session_state.skull_mesh = mesh
-                        st.session_state.maxilla_mesh = None
-                        st.session_state.mandible_mesh = None
-                        st.session_state.cut_result = None
                         st.success(
                             f"Bone mesh loaded: "
                             f"{mesh.n_points:,} vertices, "
@@ -311,6 +370,12 @@ with tab_plan:
             value=float(z_mid + (z_max - z_mid) * 0.3),
             step=0.5, key="lefort_z",
         )
+        lefort_flip = st.checkbox(
+            "Flip Le Fort mobile side",
+            value=False,
+            key="lefort_flip",
+            help="Use this if the wrong maxillary side is being freed after the cut.",
+        )
 
         st.markdown("**🔵 BSSO** — sagittal cuts through mandibular rami")
         bsso_l_x = st.slider(
@@ -342,6 +407,13 @@ with tab_plan:
             "✂️ Perform Osteotomies", key="perform_cut", type="primary"
         )
 
+        auto_update_cut = st.checkbox(
+            "Auto-update cut while moving plane sliders",
+            value=False,
+            key="auto_update_cut",
+            help="Disable for faster UI; click Perform Osteotomies to apply plane changes.",
+        )
+
     # Collect cut args
     _cut_args = (
         lefort_z, bsso_l_x, bsso_r_x,
@@ -359,7 +431,16 @@ with tab_plan:
     else:
         cutter = SurgicalCutter(st.session_state.skull_mesh)
 
-    planes = cutter.preview_planes(*_cut_args)
+    preview_signature = (
+        id(st.session_state.skull_mesh),
+        id(st.session_state.maxilla_mesh),
+        id(st.session_state.mandible_mesh),
+        *_cut_args,
+    )
+    if st.session_state.preview_signature != preview_signature:
+        st.session_state.preview_planes = cutter.preview_planes(*_cut_args)
+        st.session_state.preview_signature = preview_signature
+    planes = st.session_state.preview_planes
 
     with col_preview:
         st.subheader("Cut Plane Preview")
@@ -383,32 +464,55 @@ with tab_plan:
         plotter.add_legend()
         plotter.camera_position = "xz"
         plotter.background_color = "white"
-        _preview_key = f"preview_3d_{lefort_z}_{bsso_l_x}_{bsso_r_x}"
+        _preview_key = f"preview_3d_{hash((_cut_args, lefort_flip, has_separate))}"
         stpyvista(plotter, key=_preview_key)
 
     # --- Perform cut (or re-perform) ---
-    if perform_cut:
-        with st.spinner("Cutting bone …"):
-            result = cutter.perform_cut(*_cut_args)
+    cut_signature = (*_cut_args, bool(lefort_flip), bool(has_separate))
+    should_recut = (
+        perform_cut
+        or (
+            auto_update_cut
+            and
+            st.session_state.cut_result is not None
+            and st.session_state.last_cut_signature != cut_signature
+        )
+    )
+    if should_recut:
+        with (st.spinner("Cutting bone …") if perform_cut else st.empty()):
+            result = cutter.perform_cut(*_cut_args, lefort_flip=lefort_flip)
             st.session_state.cut_result = result
             st.session_state.cutter = cutter
+            st.session_state.last_cut_signature = cut_signature
+            st.session_state.moved_signature = None
+            st.session_state.moved_segments = None
 
-            n_skull = result["upper_skull"].n_points if result["upper_skull"] is not None else 0
-            n_max = result["mobile_maxilla"].n_points if result["mobile_maxilla"] is not None else 0
-            n_dist = result["distal_mandible"].n_points if result["distal_mandible"] is not None else 0
-            n_rami = result["proximal_rami"].n_points if result["proximal_rami"] is not None else 0
-            st.success(
-                f"Osteotomies complete! — "
-                f"Upper skull: {n_skull:,} · "
-                f"Maxilla: {n_max:,} · "
-                f"Distal mandible: {n_dist:,} · "
-                f"Proximal rami: {n_rami:,}"
-            )
-            if n_max == 0 or n_dist == 0:
-                st.warning("⚠️ A mobile segment is empty — adjust the plane positions.")
-    elif st.session_state.cut_result is not None:
-        cutter.perform_cut(*_cut_args)
+            if perform_cut:
+                n_skull = result["upper_skull"].n_points if result["upper_skull"] is not None else 0
+                n_max = result["mobile_maxilla"].n_points if result["mobile_maxilla"] is not None else 0
+                n_dist = result["distal_mandible"].n_points if result["distal_mandible"] is not None else 0
+                n_rami = result["proximal_rami"].n_points if result["proximal_rami"] is not None else 0
+                st.success(
+                    f"Osteotomies complete! — "
+                    f"Upper skull: {n_skull:,} · "
+                    f"Maxilla: {n_max:,} · "
+                    f"Distal mandible: {n_dist:,} · "
+                    f"Proximal rami: {n_rami:,}"
+                )
+                if n_max == 0 or n_dist == 0:
+                    st.warning("⚠️ A mobile segment is empty — adjust the plane positions.")
+    elif st.session_state.cut_result is not None and st.session_state.cutter is None:
+        st.session_state.cut_result = cutter.perform_cut(*_cut_args, lefort_flip=lefort_flip)
         st.session_state.cutter = cutter
+        st.session_state.last_cut_signature = cut_signature
+        st.session_state.moved_signature = None
+        st.session_state.moved_segments = None
+    elif (
+        st.session_state.cut_result is not None
+        and st.session_state.last_cut_signature != cut_signature
+        and not auto_update_cut
+    ):
+        st.info("Plane settings changed. Click **Perform Osteotomies** to update segments.")
 
     # ── Guard ────────────────────────────────────────────────
     if st.session_state.cut_result is None:
@@ -434,16 +538,48 @@ with tab_plan:
             value=st.session_state.mandible_mm,
             step=0.5, key="slider_mandible",
         )
+        move_axis = st.selectbox(
+            "Advancement direction",
+            options=[
+                "+Y (anterior)",
+                "-Y (posterior)",
+                "+X (left)",
+                "-X (right)",
+                "+Z (superior)",
+                "-Z (inferior)",
+            ],
+            index=0,
+            key="move_axis",
+        )
+        axis_vectors = {
+            "+Y (anterior)": (0.0, 1.0, 0.0),
+            "-Y (posterior)": (0.0, -1.0, 0.0),
+            "+X (left)": (1.0, 0.0, 0.0),
+            "-X (right)": (-1.0, 0.0, 0.0),
+            "+Z (superior)": (0.0, 0.0, 1.0),
+            "-Z (inferior)": (0.0, 0.0, -1.0),
+        }
+        advancement_direction = axis_vectors[move_axis]
         st.metric("Maxilla", f"{st.session_state.maxilla_mm:+.1f} mm")
         st.metric("Distal Mandible", f"{st.session_state.mandible_mm:+.1f} mm")
 
     with col_move_vis:
         st.subheader("Post-Osteotomy Preview")
         st.caption("🖱️ Left-drag to rotate · Right-drag to pan · Scroll to zoom")
-        moved = st.session_state.cutter.move_segments(
-            maxilla_mm=st.session_state.maxilla_mm,
-            mandible_mm=st.session_state.mandible_mm,
+        moved_signature = (
+            st.session_state.last_cut_signature,
+            st.session_state.maxilla_mm,
+            st.session_state.mandible_mm,
+            move_axis,
         )
+        if st.session_state.moved_signature != moved_signature:
+            st.session_state.moved_segments = st.session_state.cutter.move_segments(
+                maxilla_mm=st.session_state.maxilla_mm,
+                mandible_mm=st.session_state.mandible_mm,
+                advancement_direction=advancement_direction,
+            )
+            st.session_state.moved_signature = moved_signature
+        moved = st.session_state.moved_segments
         plotter2 = pv.Plotter(window_size=(700, 500))
         # Fixed segments (upper skull + proximal rami)
         for seg_key, seg_color, seg_label in [
@@ -465,7 +601,7 @@ with tab_plan:
         plotter2.camera_position = "xz"
         plotter2.background_color = "white"
         # Dynamic key forces re-render when slider values change
-        _move_key = f"moved_3d_{st.session_state.maxilla_mm}_{st.session_state.mandible_mm}"
+        _move_key = f"moved_3d_{hash(moved_signature)}"
         stpyvista(plotter2, key=_move_key)
 
 
@@ -495,12 +631,12 @@ with tab_predict:
         key="video_upload",
     )
     data_dir = str(VISUAL_DIR / "data")
+    input_video_path = os.path.join(data_dir, "input_video.mp4")
     if uploaded_video is not None:
-        video_save_path = os.path.join(data_dir, "input_video.mp4")
         os.makedirs(data_dir, exist_ok=True)
-        with open(video_save_path, "wb") as f:
+        with open(input_video_path, "wb") as f:
             f.write(uploaded_video.getvalue())
-        st.success(f"Video saved to `{video_save_path}`")
+        st.success(f"Video saved to `{input_video_path}`")
         st.video(uploaded_video)
 
     st.divider()
@@ -515,6 +651,8 @@ with tab_predict:
                 "Please update `VISUAL_PYTHON_PATH` in `app.py` to point to "
                 "your `omfs_visual` conda environment's python.exe."
             )
+        elif not os.path.exists(input_video_path):
+            st.error("No input video found. Upload a patient video in Step 1 first.")
         else:
             train_cmd = [
                 VISUAL_PYTHON_PATH,
@@ -522,21 +660,12 @@ with tab_predict:
                 "--data_dir", data_dir,
                 "--output_dir", model_output_dir,
             ]
-            st.info(f"Running: `{' '.join(train_cmd)}`")
-            with st.spinner("Training model … (this may take hours)"):
-                result = subprocess.run(
-                    train_cmd,
-                    capture_output=True, text=True,
-                    cwd=str(PROJECT_ROOT),
-                )
-            if result.returncode == 0:
-                st.success("Training complete!")
-                st.code(result.stdout[-2000:] if len(result.stdout) > 2000
-                        else result.stdout)
-            else:
-                st.error("Training failed.")
-                st.code(result.stderr[-2000:] if len(result.stderr) > 2000
-                        else result.stderr)
+            run_external_command(
+                cmd=train_cmd,
+                spinner_text="Training model … (this may take hours)",
+                success_text="Training complete!",
+                failure_text="Training failed.",
+            )
 
     st.divider()
 
@@ -571,6 +700,12 @@ with tab_predict:
                 f"❌ Visual Python not found at:\n`{VISUAL_PYTHON_PATH}`\n\n"
                 "Please update `VISUAL_PYTHON_PATH` in `app.py`."
             )
+        elif not os.path.exists(input_video_path):
+            st.error("No pre-op video found. Upload a video in Step 1 first.")
+        elif not os.path.exists(os.path.join(model_output_dir, "point_cloud.ply")):
+            st.error(
+                "No trained model checkpoint found. Train the model first (Step 2)."
+            )
         else:
             render_cmd = [
                 VISUAL_PYTHON_PATH,
@@ -582,24 +717,12 @@ with tab_predict:
                 "--data_dir", data_dir,
                 "--output", output_video_path,
             ]
-
-            st.info(f"Running: `{' '.join(render_cmd)}`")
-
-            with st.spinner("Rendering prediction video …"):
-                result = subprocess.run(
-                    render_cmd,
-                    capture_output=True, text=True,
-                    cwd=str(PROJECT_ROOT),
-                )
-
-            if result.returncode == 0:
-                st.success("Prediction rendered successfully!")
-                st.code(result.stdout[-2000:] if len(result.stdout) > 2000
-                        else result.stdout)
-            else:
-                st.error("Rendering failed.")
-                st.code(result.stderr[-2000:] if len(result.stderr) > 2000
-                        else result.stderr)
+            run_external_command(
+                cmd=render_cmd,
+                spinner_text="Rendering prediction video …",
+                success_text="Prediction rendered successfully!",
+                failure_text="Rendering failed.",
+            )
 
     # ── Side-by-side video display ───────────────────────────
     st.divider()
@@ -609,7 +732,6 @@ with tab_predict:
 
     with col_pre:
         st.markdown("**Pre-Op Video**")
-        input_video_path = os.path.join(data_dir, "input_video.mp4")
         if os.path.exists(input_video_path):
             st.video(input_video_path)
         else:
