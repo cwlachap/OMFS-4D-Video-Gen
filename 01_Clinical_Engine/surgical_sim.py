@@ -264,11 +264,27 @@ class SurgicalCutter:
         maxilla_mm: float = 0.0,
         mandible_mm: float = 0.0,
         advancement_direction: tuple[float, float, float] = (0.0, 1.0, 0.0),
+        maxilla_rotation: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        mandible_rotation: tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> dict:
-        """Translate mobile segments along a configured advancement direction.
+        """Translate and rotate mobile segments.
 
-        maxilla_mm  moves ONLY the mobile maxilla.
-        mandible_mm moves ONLY the distal mandible.
+        Parameters
+        ----------
+        maxilla_mm : float
+            Translation distance for mobile maxilla (mm).
+        mandible_mm : float
+            Translation distance for distal mandible (mm).
+        advancement_direction : tuple
+            Unit direction vector for translation.
+        maxilla_rotation : tuple
+            Rotation angles (pitch, yaw, roll) in degrees for maxilla.
+        mandible_rotation : tuple
+            Rotation angles (pitch, yaw, roll) in degrees for mandible.
+
+        Notes
+        -----
+        Rotation is applied around each segment's centroid, then translation.
         Upper skull and proximal rami stay fixed.
         """
         if self.mobile_maxilla is None or self.distal_mandible is None:
@@ -278,6 +294,30 @@ class SurgicalCutter:
         moved_maxilla = self.mobile_maxilla.copy()
         moved_mandible = self.distal_mandible.copy()
 
+        # Apply rotation to maxilla (around its centroid)
+        if any(r != 0.0 for r in maxilla_rotation):
+            pitch, yaw, roll = maxilla_rotation
+            center = moved_maxilla.center
+            # Rotate: pitch around X, yaw around Z, roll around Y
+            if pitch != 0.0:
+                moved_maxilla.rotate_x(pitch, point=center, inplace=True)
+            if yaw != 0.0:
+                moved_maxilla.rotate_z(yaw, point=center, inplace=True)
+            if roll != 0.0:
+                moved_maxilla.rotate_y(roll, point=center, inplace=True)
+
+        # Apply rotation to mandible (around its centroid)
+        if any(r != 0.0 for r in mandible_rotation):
+            pitch, yaw, roll = mandible_rotation
+            center = moved_mandible.center
+            if pitch != 0.0:
+                moved_mandible.rotate_x(pitch, point=center, inplace=True)
+            if yaw != 0.0:
+                moved_mandible.rotate_z(yaw, point=center, inplace=True)
+            if roll != 0.0:
+                moved_mandible.rotate_y(roll, point=center, inplace=True)
+
+        # Apply translation
         moved_maxilla.translate(tuple(adv_dir * maxilla_mm), inplace=True)
         moved_mandible.translate(tuple(adv_dir * mandible_mm), inplace=True)
 

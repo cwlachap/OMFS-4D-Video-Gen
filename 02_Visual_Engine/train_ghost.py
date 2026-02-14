@@ -14,9 +14,12 @@ This script is called from app.py via subprocess.
 """
 
 import argparse
+import hashlib
+import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -62,11 +65,133 @@ def validate_data(data_dir: str):
     print(f"[train_ghost] Dataset validated: {n_images} frames")
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_dataset_fingerprint(data_dir: str) -> dict:
+    """Build a reproducible fingerprint for the dataset used in training."""
+    data_path = Path(data_dir)
+    key_files = [
+        "transforms_train.json",
+        "transforms_test.json",
+        "transforms_val.json",
+        "flame_param.npz",
+        "canonical_flame_param.npz",
+    ]
+    file_hashes = {}
+    for rel in key_files:
+        p = data_path / rel
+        if p.exists():
+            file_hashes[rel] = _sha256_file(p)
+
+    aggregate = hashlib.sha256(
+        json.dumps(file_hashes, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    return {"files": file_hashes, "dataset_hash": aggregate}
+
+
+def run_quality_gates(data_dir: str):
+    """Run light-weight pre-train quality gates to fail fast on bad data."""
+    data_path = Path(data_dir)
+    train_json = data_path / "transforms_train.json"
+    with open(train_json, "r", encoding="utf-8") as f:
+        train_data = json.load(f)
+    frames = train_data.get("frames", [])
+    if len(frames) < 50:
+        raise RuntimeError(
+            f"Quality gate failed: only {len(frames)} training frames; need at least 50."
+        )
+
+    # Ensure frame indices are mostly contiguous (drop-heavy datasets often regress quality).
+    timestep_indices = [
+        int(fr.get("timestep_index", i)) for i, fr in enumerate(frames)
+    ]
+    gaps = sum(
+        1 for i in range(1, len(timestep_indices))
+        if (timestep_indices[i] - timestep_indices[i - 1]) > 1
+    )
+    if gaps > max(10, len(timestep_indices) // 10):
+        raise RuntimeError(
+            f"Quality gate failed: too many timeline gaps in train split ({gaps})."
+        )
+
+    masks_dir = data_path / "fg_masks"
+    if masks_dir.exists():
+        n_masks = len([f for f in masks_dir.iterdir() if f.suffix.lower() == ".png"])
+        if n_masks < len(frames) // 2:
+            raise RuntimeError(
+                f"Quality gate failed: only {n_masks} fg masks for {len(frames)} train frames."
+            )
+
+    print(
+        "[train_ghost] Quality gates passed:"
+        f" frames={len(frames)}, timeline_gaps={gaps}"
+    )
+
+
+def _collect_checkpoint_lineage(output_dir: str):
+    out = Path(output_dir)
+    if not out.exists():
+        return []
+    checkpoints = []
+    for ckpt in sorted(out.glob("chkpnt*.pth")):
+        checkpoints.append(
+            {
+                "name": ckpt.name,
+                "size_bytes": ckpt.stat().st_size,
+                "modified_utc": datetime.fromtimestamp(
+                    ckpt.stat().st_mtime, tz=timezone.utc
+                ).isoformat(),
+            }
+        )
+    return checkpoints
+
+
+def write_experiment_manifest(
+    data_dir: str,
+    output_dir: str,
+    iterations: int,
+    resolution: int,
+    cmd: list[str],
+    extra: dict,
+):
+    out = Path(output_dir)
+    manifests_dir = out / "experiment_manifests"
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    manifest_path = manifests_dir / f"{now}.json"
+
+    payload = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "data_dir": str(Path(data_dir).resolve()),
+        "output_dir": str(Path(output_dir).resolve()),
+        "iterations": iterations,
+        "resolution": resolution,
+        "command": cmd,
+        "dataset_fingerprint": build_dataset_fingerprint(data_dir),
+        "checkpoint_lineage": _collect_checkpoint_lineage(output_dir),
+        "extra": extra,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"[train_ghost] Wrote experiment manifest: {manifest_path}")
+    return manifest_path
+
+
 def train(
     data_dir: str,
     output_dir: str,
     iterations: int = 30000,
-    resolution: int = 512,
+    resolution: int = -1,
 ):
     """Launch GaussianAvatars training.
 
@@ -79,14 +204,26 @@ def train(
     iterations : int
         Number of training iterations.
     resolution : int
-        Training resolution.
+        Training resolution. -1 means native resolution (recommended).
     """
     validate_setup()
     validate_data(data_dir)
+    run_quality_gates(data_dir)
 
     os.makedirs(output_dir, exist_ok=True)
 
     # Build the training command
+    # Calculate save iterations - save at end and a few checkpoints along the way
+    save_iters = [iterations]  # Always save at final iteration
+    if iterations >= 5000:
+        save_iters.insert(0, iterations // 2)  # Midpoint checkpoint
+    if iterations >= 10000:
+        save_iters.insert(0, iterations // 4)  # Quarter checkpoint
+    
+    # Check if fg_masks exist - only use white_background if we have masks
+    fg_masks_dir = os.path.join(data_dir, "fg_masks")
+    has_masks = os.path.isdir(fg_masks_dir) and len(os.listdir(fg_masks_dir)) > 0
+
     cmd = [
         sys.executable,
         str(TRAIN_SCRIPT),
@@ -95,8 +232,24 @@ def train(
         "--bind_to_mesh",
         "--iterations", str(iterations),
         "--resolution", str(resolution),
-        "--white_background",
+        "--save_iterations", *[str(i) for i in save_iters],
+        "--checkpoint_iterations", *[str(i) for i in save_iters],
     ]
+
+    if has_masks:
+        cmd.append("--white_background")
+        print(f"[train_ghost] Using white background (fg_masks found)")
+    else:
+        print(f"[train_ghost] Using original background (no fg_masks)")
+
+    write_experiment_manifest(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        iterations=iterations,
+        resolution=resolution,
+        cmd=cmd,
+        extra={"has_masks": has_masks},
+    )
 
     print(f"[train_ghost] Starting training:")
     print(f"  Data:       {data_dir}")
@@ -136,12 +289,12 @@ def main():
         help="Path to save trained model.",
     )
     parser.add_argument(
-        "--iterations", type=int, default=30000,
-        help="Training iterations (default 30000 for quick test, 600000 for full).",
+        "--iterations", type=int, default=5000,
+        help="Training iterations (default 5000 for quick test, 30000 for good quality, 600000 for full).",
     )
     parser.add_argument(
-        "--resolution", type=int, default=512,
-        help="Training resolution.",
+        "--resolution", type=int, default=-1,
+        help="Training resolution. -1 = native resolution (recommended).",
     )
     args = parser.parse_args()
 

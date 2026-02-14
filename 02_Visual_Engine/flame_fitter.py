@@ -119,6 +119,38 @@ class SimpleFLAME(nn.Module):
         faces = np.array(model["f"], dtype=np.int64)
         self.register_buffer("faces", torch.tensor(faces, dtype=torch.long))
 
+    def _axis_angle_to_matrix(self, axis_angle):
+        """Convert axis-angle rotation to rotation matrix.
+        
+        Parameters
+        ----------
+        axis_angle : (B, 3) tensor
+        
+        Returns
+        -------
+        (B, 3, 3) rotation matrices
+        """
+        B = axis_angle.shape[0]
+        angle = torch.norm(axis_angle, dim=1, keepdim=True)  # (B, 1)
+        axis = axis_angle / (angle + 1e-8)  # (B, 3)
+        
+        # Rodrigues formula
+        cos_a = torch.cos(angle).unsqueeze(-1)  # (B, 1, 1)
+        sin_a = torch.sin(angle).unsqueeze(-1)  # (B, 1, 1)
+        
+        # Skew-symmetric matrix
+        zeros = torch.zeros(B, device=axis_angle.device)
+        K = torch.stack([
+            torch.stack([zeros, -axis[:, 2], axis[:, 1]], dim=1),
+            torch.stack([axis[:, 2], zeros, -axis[:, 0]], dim=1),
+            torch.stack([-axis[:, 1], axis[:, 0], zeros], dim=1),
+        ], dim=1)  # (B, 3, 3)
+        
+        I = torch.eye(3, device=axis_angle.device).unsqueeze(0).expand(B, -1, -1)
+        R = I + sin_a * K + (1 - cos_a) * torch.bmm(K, K)
+        
+        return R
+
     def forward(self, shape, expr, rotation, jaw, translation):
         """
         Parameters — all batched (B, ...):
@@ -134,7 +166,7 @@ class SimpleFLAME(nn.Module):
         B = shape.shape[0]
 
         # Shape + expression blend shapes
-        v = self.v_template.unsqueeze(0).expand(B, -1, -1)
+        v = self.v_template.unsqueeze(0).expand(B, -1, -1).clone()
         v = v + torch.einsum("bijk,bk->bij",
                              self.shapedirs_shape.unsqueeze(0).expand(B, -1, -1, -1),
                              shape)
@@ -142,19 +174,19 @@ class SimpleFLAME(nn.Module):
                              self.shapedirs_expr.unsqueeze(0).expand(B, -1, -1, -1),
                              expr)
 
-        # Simple translation (skip full LBS for speed — good enough for fitting)
-        v = v + translation.unsqueeze(1)
-
-        # Apply jaw rotation to approximate jaw movement
-        # jaw[0] = opening angle around X axis
-        jaw_angle = jaw[:, 0:1]  # (B, 1)
-        # Move lower face vertices down proportional to jaw angle
-        # Vertices below y=0 in template space are roughly the lower jaw
+        # Apply jaw rotation to lower face vertices
+        jaw_angle = jaw[:, 0:1]  # (B, 1) - jaw opening around X axis
         lower_mask = (self.v_template[:, 1] < self.v_template[:, 1].mean()).float()
         jaw_offset = torch.zeros_like(v)
-        jaw_offset[:, :, 1] = -jaw_angle * lower_mask.unsqueeze(0) * 0.1
-
+        jaw_offset[:, :, 1] = -jaw_angle * lower_mask.unsqueeze(0) * 0.15  # Increased effect
         v = v + jaw_offset
+
+        # Apply global head rotation
+        R = self._axis_angle_to_matrix(rotation)  # (B, 3, 3)
+        v = torch.bmm(v, R.transpose(1, 2))  # (B, N_verts, 3)
+
+        # Apply translation
+        v = v + translation.unsqueeze(1)
 
         # Compute landmarks from vertices via barycentric interpolation
         lmk_faces = self.faces[self.lmk_faces_idx]  # (N_lmk, 3) — vertex indices
@@ -212,6 +244,53 @@ def detect_landmarks_mediapipe(images_dir: str) -> list:
     return all_landmarks
 
 
+def estimate_head_pose_from_landmarks(landmarks_2d, image_size):
+    """Estimate head rotation (yaw, pitch) from 2D landmarks using geometric heuristics.
+    
+    This gives a rough estimate of head pose that can be refined by optimization.
+    """
+    W, H = image_size
+    
+    if landmarks_2d is None:
+        return 0.0, 0.0, 0.0
+    
+    # Normalize landmarks to [-1, 1]
+    lmk = landmarks_2d.copy()
+    lmk[:, 0] = lmk[:, 0] / W * 2 - 1
+    lmk[:, 1] = lmk[:, 1] / H * 2 - 1
+    
+    # Nose tip is around index 30-35 in the 68-landmark set
+    # Left eye outer corner ~36, right eye outer corner ~45
+    # Jaw: 0-16
+    
+    nose_tip = lmk[30] if len(lmk) > 30 else lmk[len(lmk)//2]
+    
+    # Estimate yaw from nose position relative to face center
+    jaw_left = lmk[0]
+    jaw_right = lmk[16] if len(lmk) > 16 else lmk[-1]
+    face_center_x = (jaw_left[0] + jaw_right[0]) / 2
+    
+    # Yaw: positive = looking right, negative = looking left
+    yaw = (nose_tip[0] - face_center_x) * 1.5  # Scale factor for axis-angle
+    
+    # Estimate pitch from vertical position of nose relative to eyes
+    if len(lmk) > 45:
+        left_eye = lmk[36:42].mean(axis=0) if len(lmk) > 42 else lmk[36]
+        right_eye = lmk[42:48].mean(axis=0) if len(lmk) > 48 else lmk[42]
+        eye_center_y = (left_eye[1] + right_eye[1]) / 2
+        pitch = (nose_tip[1] - eye_center_y) * 0.5  # Scale factor
+    else:
+        pitch = 0.0
+    
+    # Roll from eye tilt
+    if len(lmk) > 45:
+        roll = (right_eye[1] - left_eye[1]) * 0.3
+    else:
+        roll = 0.0
+    
+    return float(pitch), float(yaw), float(roll)
+
+
 def fit_flame_to_landmarks(
     landmarks_2d_list: list,
     image_size: tuple,
@@ -244,23 +323,42 @@ def fit_flame_to_landmarks(
 
     flame = SimpleFLAME(flame_model_path, n_shape, n_expr).to(device)
 
+    # Initialize rotation from geometric estimation
+    print(f"[flame_fitter] Estimating initial head poses from landmarks...")
+    initial_rotations = np.zeros((T, 3), dtype=np.float32)
+    for i, lmk in enumerate(landmarks_2d_list):
+        pitch, yaw, roll = estimate_head_pose_from_landmarks(lmk, image_size)
+        initial_rotations[i] = [pitch, yaw, roll]
+    
+    print(f"[flame_fitter] Initial rotation range:")
+    print(f"  Pitch: {initial_rotations[:,0].min():.3f} to {initial_rotations[:,0].max():.3f}")
+    print(f"  Yaw:   {initial_rotations[:,1].min():.3f} to {initial_rotations[:,1].max():.3f}")
+    print(f"  Roll:  {initial_rotations[:,2].min():.3f} to {initial_rotations[:,2].max():.3f}")
+
     # Optimizable parameters
     shape = nn.Parameter(torch.zeros(1, n_shape, device=device))
     expr = nn.Parameter(torch.zeros(T, n_expr, device=device))
-    rotation = nn.Parameter(torch.zeros(T, 3, device=device))
+    rotation = nn.Parameter(torch.tensor(initial_rotations, device=device))
     jaw = nn.Parameter(torch.zeros(T, 3, device=device))
     translation = nn.Parameter(torch.zeros(T, 3, device=device))
 
     # Initialize translation to roughly center the face
     with torch.no_grad():
         translation[:, 2] = -5.0  # move face back from camera
+        # Initialize X/Y translation from landmark center
+        for i in valid_indices:
+            lmk = landmarks_2d_list[i]
+            center_x = float(lmk[:, 0].mean() / W * 2 - 1)
+            center_y = float(lmk[:, 1].mean() / H * 2 - 1)
+            translation[i, 0] = center_x * 2
+            translation[i, 1] = center_y * 2
 
     optimizer = optim.Adam([
         {"params": shape, "lr": lr * 0.1},
         {"params": expr, "lr": lr},
-        {"params": rotation, "lr": lr * 0.5},
+        {"params": rotation, "lr": lr * 0.3},
         {"params": jaw, "lr": lr},
-        {"params": translation, "lr": lr},
+        {"params": translation, "lr": lr * 0.5},
     ])
 
     # Prepare target landmarks
@@ -298,12 +396,12 @@ def fit_flame_to_landmarks(
         reg_expr = (expr ** 2).mean() * 0.0001
         reg_jaw = (jaw ** 2).mean() * 0.001
 
-        # Temporal smoothness
+        # Temporal smoothness (reduced to allow motion)
         if T > 1:
-            smooth_expr = ((expr[1:] - expr[:-1]) ** 2).mean() * 0.01
-            smooth_jaw = ((jaw[1:] - jaw[:-1]) ** 2).mean() * 0.01
-            smooth_rot = ((rotation[1:] - rotation[:-1]) ** 2).mean() * 0.01
-            smooth_trans = ((translation[1:] - translation[:-1]) ** 2).mean() * 0.01
+            smooth_expr = ((expr[1:] - expr[:-1]) ** 2).mean() * 0.001
+            smooth_jaw = ((jaw[1:] - jaw[:-1]) ** 2).mean() * 0.001
+            smooth_rot = ((rotation[1:] - rotation[:-1]) ** 2).mean() * 0.001
+            smooth_trans = ((translation[1:] - translation[:-1]) ** 2).mean() * 0.001
         else:
             smooth_expr = smooth_jaw = smooth_rot = smooth_trans = 0
 
@@ -324,10 +422,16 @@ def fit_flame_to_landmarks(
         expr_full = torch.zeros(T, 100, device=device)
         expr_full[:, :n_expr] = expr
 
+        final_rot = rotation.cpu().numpy()
+        print(f"[flame_fitter] Final rotation range:")
+        print(f"  Pitch: {final_rot[:,0].min():.3f} to {final_rot[:,0].max():.3f}")
+        print(f"  Yaw:   {final_rot[:,1].min():.3f} to {final_rot[:,1].max():.3f}")
+        print(f"  Roll:  {final_rot[:,2].min():.3f} to {final_rot[:,2].max():.3f}")
+
         result = {
             "shape": shape_full.cpu().numpy(),
             "expr": expr_full.cpu().numpy(),
-            "rotation": rotation.cpu().numpy(),
+            "rotation": final_rot,
             "neck_pose": np.zeros((T, 3), dtype=np.float32),
             "jaw_pose": jaw.cpu().numpy(),
             "eyes_pose": np.zeros((T, 6), dtype=np.float32),
